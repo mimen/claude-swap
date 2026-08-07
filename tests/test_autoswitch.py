@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import threading
 from dataclasses import replace
 from pathlib import Path
@@ -33,7 +34,7 @@ from claude_swap.autoswitch import (
 from claude_swap.json_output import USAGE_FOREIGN_CREDENTIAL, USAGE_TOKEN_EXPIRED
 from claude_swap.usage_store import FetchRecord, UsageEntry
 from claude_swap.models import Platform
-from claude_swap.settings import AutoSwitchSettings
+from claude_swap.settings import AutoSwitchSettings, set_setting
 from claude_swap.switcher import ClaudeAccountSwitcher
 
 
@@ -1917,6 +1918,41 @@ class TestQuarantineLifecycle:
         state = harness.state()
         assert state["lastSwitchAt"] == 123.0
         assert "3" in state["quarantine"]
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX lock probe")
+    def test_hook_runs_after_state_record_and_warning_reaches_renderers(
+        self, harness, tmp_path,
+    ):
+        observed = tmp_path / "hook-observed.json"
+        state_lock = harness.switcher.backup_dir / ".autoswitch_state.lock"
+        state_path = harness.switcher.backup_dir / "autoswitch_state.json"
+        hook = tmp_path / "post-switch-hook"
+        hook.write_text(
+            "#!/usr/bin/env python3\n"
+            "import fcntl, json, pathlib, sys\n"
+            f"lock_path = pathlib.Path({str(state_lock)!r})\n"
+            f"state_path = pathlib.Path({str(state_path)!r})\n"
+            f"observed = pathlib.Path({str(observed)!r})\n"
+            "handle = lock_path.open('w')\n"
+            "fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+            "observed.write_text(json.dumps(json.loads(state_path.read_text())))\n"
+            "print('autoswitch hook failed', file=sys.stderr)\n"
+            "raise SystemExit(6)\n"
+        )
+        hook.chmod(0o755)
+        set_setting(harness.switcher.backup_dir, "hooks.postSwitch", str(hook))
+
+        outcome = harness.tick_with_usage({
+            "1": _usage(95), "2": _usage(10), "3": _usage(50),
+        })
+
+        assert outcome is TickOutcome.SWITCHED
+        assert json.loads(observed.read_text())["lastSwitchTo"] == "2"
+        event = next(item for item in harness.events if isinstance(item, SwitchEvent))
+        expected = "Post-switch hook exited with status 6: autoswitch hook failed"
+        assert event.warnings == [expected]
+        assert expected in event.human()
+        assert event.to_json()["warnings"] == [expected]
 
 
 class TestDryRunAndNoOp:

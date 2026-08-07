@@ -16,6 +16,7 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -664,6 +665,35 @@ class TestMiniAccountText:
 
 
 class TestRunAction:
+    def test_successful_manual_switch_visibly_surfaces_payload_warnings(
+        self, tmp_path,
+    ):
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        result = tui_data.ActionResult(
+            ok=True,
+            output="",
+            payload={
+                "switched": True,
+                "to": {"number": 2, "email": "user2@example.com"},
+                "warnings": ["Post-switch hook exited with status 7: failed"],
+            },
+        )
+
+        with patch.object(app, "notify") as notify, patch.object(
+            app, "request_refresh"
+        ):
+            app._action_done("Switch to account 2", result, False)
+
+        assert any(
+            call.args
+            and "Post-switch hook exited with status 7: failed" in call.args[0]
+            and call.kwargs.get("severity") == "warning"
+            for call in notify.call_args_list
+        )
+
     def test_captures_output_and_payload(self):
         def fn():
             print("hello")

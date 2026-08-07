@@ -363,7 +363,10 @@ class SwitchEvent(AutoSwitchEvent):
             else "?"
         )
         prefix = "[dry-run] would switch" if self.dry_run else "Switched"
-        return f"{prefix} {src} -> {dst} ({self.trigger})"
+        line = f"{prefix} {src} -> {dst} ({self.trigger})"
+        if self.warnings:
+            line += f" | Warning: {' '.join(self.warnings)}"
+        return line
 
 
 @dataclass(frozen=True)
@@ -2075,7 +2078,11 @@ class AutoSwitchEngine:
                 self._emit(NoSwitchEvent(reason="cooldown"))
                 return TickOutcome.NO_ACTION
 
-            result = self.switcher.switch_to(number, json_output=True)
+            result = self.switcher.switch_to(
+                number,
+                json_output=True,
+                _defer_post_switch_hook=True,
+            )
             if not result or not result.get("switched"):
                 self._emit(
                     NoSwitchEvent(
@@ -2107,6 +2114,12 @@ class AutoSwitchEngine:
             # reader never has to guess.
             state["leftTrigger"] = trigger
             atomic_write_json(self.state_path, state)
+
+        # The serialized decision and cooldown record are committed before any
+        # user executable runs. The hook has its own ordering lock and must not
+        # inherit this state lock, otherwise a child that probes autoswitch state
+        # or invokes cswap can deadlock the engine.
+        self.switcher._run_post_switch_hook(result, emit_output=False)
 
         self._emit(
             SwitchEvent(

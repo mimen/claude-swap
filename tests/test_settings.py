@@ -15,8 +15,10 @@ from claude_swap.settings import (
     SETTING_SPECS,
     atomic_write_json,
     AutoSwitchSettings,
+    HooksSettings,
     UiSettings,
     effective_settings,
+    load_hooks_settings,
     load_settings,
     load_ui_settings,
     merged_with_cli,
@@ -152,6 +154,33 @@ class TestUiSettings:
             set_setting(tmp_path, "ui.theme", "purple")
 
 
+class TestHooksSettings:
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX executable mode")
+    def test_set_load_and_unset_post_switch_executable(self, tmp_path: Path):
+        executable = tmp_path / "hook"
+        executable.write_text("#!/bin/sh\nexit 0\n")
+        executable.chmod(0o755)
+
+        assert set_setting(tmp_path, "hooks.postSwitch", str(executable)) == str(executable)
+        assert load_hooks_settings(tmp_path) == HooksSettings(
+            post_switch=str(executable)
+        )
+        assert unset_setting(tmp_path, "hooks.postSwitch") is True
+        assert load_hooks_settings(tmp_path) == HooksSettings()
+
+    def test_rejects_relative_post_switch_path(self, tmp_path: Path):
+        with pytest.raises(ConfigError, match="absolute path"):
+            set_setting(tmp_path, "hooks.postSwitch", "relative-hook")
+
+    def test_rejects_embedded_nul_as_config_error(self, tmp_path: Path):
+        with pytest.raises(ConfigError, match="embedded NUL"):
+            set_setting(
+                tmp_path,
+                "hooks.postSwitch",
+                str(tmp_path / "bad\x00hook"),
+            )
+
+
 class TestSettingSpecs:
     def test_registry_covers_every_dataclass_field(self):
         by_section: dict[str, set[str]] = {}
@@ -163,9 +192,16 @@ class TestSettingSpecs:
         assert by_section["ui"] == {
             f.name for f in UiSettings.__dataclass_fields__.values()
         }
+        assert by_section["hooks"] == {
+            f.name for f in HooksSettings.__dataclass_fields__.values()
+        }
 
     def test_defaults_match_dataclass(self):
-        sources = {"autoswitch": AutoSwitchSettings(), "ui": UiSettings()}
+        sources = {
+            "autoswitch": AutoSwitchSettings(),
+            "ui": UiSettings(),
+            "hooks": HooksSettings(),
+        }
         for spec in SETTING_SPECS.values():
             assert spec.default == getattr(sources[spec.section], spec.field)
 

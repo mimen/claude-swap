@@ -48,6 +48,11 @@ from claude_swap.credentials import (  # noqa: F401  (constants re-exported for 
     merge_shared_credential_fields,
     shared_credential_fields,
 )
+from claude_swap.hooks import (
+    HOOK_ACTIVE_ENV,
+    HOOK_ORDER_LOCK_TIMEOUT_SECONDS,
+    run_post_switch_hook,
+)
 from claude_swap.locking import FileLock
 from claude_swap.logging_config import setup_logging
 from claude_swap.models import (
@@ -81,7 +86,12 @@ from claude_swap.paths import (
 )
 from claude_swap.process_detection import get_running_instances
 from claude_swap import poll_policy
-from claude_swap.settings import load_settings, parse_model_names, settings_path
+from claude_swap.settings import (
+    load_hooks_settings,
+    load_settings,
+    parse_model_names,
+    settings_path,
+)
 from claude_swap.usage_store import (
     FetchRecord,
     UsageEntry,
@@ -4146,6 +4156,66 @@ class ClaudeAccountSwitcher:
 
         self.add_account()
 
+    def _run_post_switch_hook(self, op: dict, *, emit_output: bool) -> None:
+        """Invoke the configured hook after a committed identity change.
+
+        A dedicated cross-process lock orders hook side effects without holding
+        claude-swap's account lock or Claude's credential/config locks. Once the
+        hook lock is ours, re-check both the recorded slot and Claude's local
+        live identity: a later switch or external /login may have superseded
+        this result while we waited.
+        """
+        if op["from"] == op["to"] or os.environ.get(HOOK_ACTIVE_ENV) == "1":
+            return
+        executable = load_hooks_settings(self.backup_dir).post_switch
+        if executable is None:
+            return
+        try:
+            with FileLock(
+                self.backup_dir / ".post_switch_hook.lock",
+                timeout=HOOK_ORDER_LOCK_TIMEOUT_SECONDS,
+            ):
+                data = self._get_sequence_data() or {}
+                active = data.get("activeAccountNumber")
+                to_ref = op["to"]
+                target_number = to_ref.get("number")
+                target = data.get("accounts", {}).get(str(target_number), {})
+                if (
+                    active != target_number
+                    or target.get("email", "") != to_ref.get("email", "")
+                ):
+                    return
+                live_identity = self._get_current_account()
+                if (
+                    live_identity is None
+                    or live_identity[0] != target.get("email", "")
+                ):
+                    return
+                if (
+                    "organizationUuid" in target
+                    and live_identity[1]
+                    != (target.get("organizationUuid", "") or "")
+                ):
+                    return
+                hook_warning = run_post_switch_hook(
+                    executable, op["from"], to_ref
+                )
+        except LockError as exc:
+            hook_warning = f"Post-switch hook ordering failed: {exc}"
+        except Exception as exc:
+            detail = str(exc).splitlines()[0] if str(exc) else ""
+            detail = "".join(
+                char if char.isprintable() else "?" for char in detail
+            )[:200]
+            hook_warning = f"Post-switch hook failed: {type(exc).__name__}"
+            if detail:
+                hook_warning += f": {detail}"
+        if hook_warning is None:
+            return
+        op["warnings"].append(hook_warning)
+        if emit_output:
+            warning(hook_warning)
+
     def _switch_result_from_op(
         self, op: dict, strategy: str, extra_warnings: list[str] | None = None
     ) -> dict:
@@ -4305,6 +4375,7 @@ class ClaudeAccountSwitcher:
                     )
                 target = fallback
             op = self._perform_switch(target, emit_output=not json_output)
+            self._run_post_switch_hook(op, emit_output=not json_output)
             return (
                 self._switch_result_from_op(op, strategy_label, warnings)
                 if json_output else None
@@ -4371,6 +4442,7 @@ class ClaudeAccountSwitcher:
             )
             if target is not None:
                 op = self._perform_switch(target, emit_output=not json_output)
+                self._run_post_switch_hook(op, emit_output=not json_output)
                 return (
                     self._switch_result_from_op(op, strategy_label, warnings)
                     if json_output else None
@@ -4591,13 +4663,18 @@ class ClaudeAccountSwitcher:
         op = self._perform_switch(
             next_account, emit_output=not json_output, provenance=provenance
         )
+        self._run_post_switch_hook(op, emit_output=not json_output)
         return (
             self._switch_result_from_op(op, strategy_label, warnings)
             if json_output else None
         )
 
     def switch_to(
-        self, identifier: str, json_output: bool = False, force: bool = False
+        self,
+        identifier: str,
+        json_output: bool = False,
+        force: bool = False,
+        _defer_post_switch_hook: bool = False,
     ) -> dict | None:
         """Switch to specific account.
 
@@ -4703,6 +4780,8 @@ class ClaudeAccountSwitcher:
             force_activate=force,
             provenance=provenance,
         )
+        if not _defer_post_switch_hook:
+            self._run_post_switch_hook(op, emit_output=not json_output)
         result = self._switch_result_from_op(op, "direct") if json_output else None
         # A forced self-activation really rewrote the live credentials from the
         # stored backup — "already-active" would misdescribe that mutation.

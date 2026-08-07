@@ -6,6 +6,7 @@ import base64
 import json
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
@@ -14,7 +15,13 @@ import pytest
 
 from claude_swap import macos_keychain
 from claude_swap import oauth
+from claude_swap.claude_locks import (
+    config_lock_dir,
+    credentials_lock_dir,
+    oauth_refresh_lock_dir,
+)
 from claude_swap.json_output import USAGE_FOREIGN_CREDENTIAL, USAGE_TOKEN_EXPIRED
+from claude_swap.locking import FileLock
 from claude_swap.exceptions import (
     AccountNotFoundError,
     ConfigError,
@@ -27,6 +34,7 @@ from claude_swap.macos_keychain import KeychainError
 from claude_swap.models import Platform, normalize_alias
 from claude_swap.paths import get_backup_root, get_credentials_path
 from claude_swap.credentials import ActiveCredentials
+from claude_swap.settings import set_setting, settings_path
 from claude_swap.switcher import (
     CLAUDE_CODE_KEYCHAIN_SERVICE,
     ClaudeAccountSwitcher,
@@ -6962,6 +6970,730 @@ class TestProvenanceGuard:
         assert creds_store[("1", "test@example.com")] == moved
         assert switcher.list_unclaimed_credentials() == {}
         assert op["warnings"] == []
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX executable test helper")
+class TestPostSwitchHook:
+    _setup_two_accounts = TestPerformSwitchPostDisplay._setup_two_accounts
+    _install_store_patches = staticmethod(
+        TestPerformSwitchPostDisplay._install_store_patches
+    )
+
+    def test_public_switch_to_invokes_executable_once_with_stable_payload(
+        self, temp_home, mock_claude_config, sample_sequence_data, tmp_path,
+    ):
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        live_state = {"creds": json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-live-1", "refreshToken": "rt-live-1",
+        }})}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        received = tmp_path / "hook-input.json"
+        hook = tmp_path / "post-switch-hook"
+        hook.write_text(
+            "#!/usr/bin/env python3\n"
+            "import pathlib, sys\n"
+            f"pathlib.Path({str(received)!r}).write_bytes(sys.stdin.buffer.read())\n"
+        )
+        hook.chmod(0o755)
+        set_setting(switcher.backup_dir, "hooks.postSwitch", str(hook))
+
+        try:
+            with patch.object(switcher, "list_accounts"):
+                result = switcher.switch_to("2", json_output=True)
+        finally:
+            for p in patches:
+                p.stop()
+
+        assert result["switched"] is True
+        assert received.read_bytes() == (
+            b'{"schemaVersion":1,"event":"postSwitch",'
+            b'"from":{"number":1,"email":"test@example.com"},'
+            b'"to":{"number":2,"email":"account2@example.com"}}'
+        )
+
+    def _concurrent_switchers(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        sample_sequence_data["sequence"].append(3)
+        sample_sequence_data["accounts"]["3"] = {
+            "email": "account3@example.com",
+            "uuid": "uuid-3",
+            "added": "2024-01-03T00:00:00Z",
+        }
+        first = ClaudeAccountSwitcher()
+        first._setup_directories()
+        first._write_json(first.sequence_file, sample_sequence_data)
+        second = ClaudeAccountSwitcher()
+        return first, second
+
+    @staticmethod
+    def _fake_committing_switch(switcher, target, committed=None):
+        def perform(*args, **kwargs):
+            data = switcher._get_sequence_data()
+            account = data["accounts"][str(target)]
+            data["activeAccountNumber"] = int(target)
+            switcher._write_json(switcher.sequence_file, data)
+            switcher._write_json(
+                switcher._get_claude_config_path(),
+                {
+                    "oauthAccount": {
+                        "emailAddress": account["email"],
+                        "organizationUuid": account.get("organizationUuid", ""),
+                    }
+                },
+            )
+            if committed is not None:
+                committed.set()
+            return {
+                "from": {"number": 1, "email": "test@example.com"},
+                "to": {
+                    "number": int(target),
+                    "email": account["email"],
+                },
+                "warnings": [],
+            }
+        return perform
+
+    def test_stale_concurrent_switch_hook_is_skipped(
+        self, temp_home, mock_claude_config, sample_sequence_data, tmp_path,
+    ):
+        first, second = self._concurrent_switchers(
+            temp_home, mock_claude_config, sample_sequence_data,
+        )
+        calls = tmp_path / "calls"
+        hook = tmp_path / "post-switch-hook"
+        hook.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, pathlib, sys\n"
+            "payload = json.load(sys.stdin)\n"
+            f"path = pathlib.Path({str(calls)!r})\n"
+            "old = path.read_text() if path.exists() else ''\n"
+            "path.write_text(old + str(payload['to']['number']) + '\\n')\n"
+        )
+        hook.chmod(0o755)
+        set_setting(first.backup_dir, "hooks.postSwitch", str(hook))
+        first_committed = threading.Event()
+        second_committed = threading.Event()
+        first._perform_switch = self._fake_committing_switch(
+            first, "2", first_committed,
+        )
+        second._perform_switch = self._fake_committing_switch(
+            second, "3", second_committed,
+        )
+        results = {}
+        hook_lock = first.backup_dir / ".post_switch_hook.lock"
+
+        with FileLock(hook_lock):
+            thread_a = threading.Thread(
+                target=lambda: results.setdefault(
+                    "a", first.switch_to("2", json_output=True)
+                )
+            )
+            thread_a.start()
+            assert first_committed.wait(2)
+            thread_b = threading.Thread(
+                target=lambda: results.setdefault(
+                    "b", second.switch_to("3", json_output=True)
+                )
+            )
+            thread_b.start()
+            assert second_committed.wait(2)
+
+        thread_a.join(5)
+        thread_b.join(5)
+        assert not thread_a.is_alive() and not thread_b.is_alive()
+        assert calls.read_text().splitlines() == ["3"]
+        assert results["a"]["warnings"] == []
+        assert results["b"]["warnings"] == []
+
+    def test_external_login_while_waiting_skips_stale_hook(
+        self, temp_home, mock_claude_config, sample_sequence_data, tmp_path,
+    ):
+        first, _second = self._concurrent_switchers(
+            temp_home, mock_claude_config, sample_sequence_data,
+        )
+        first_data = first._get_sequence_data()
+        first_data["accounts"]["2"]["organizationUuid"] = "org-target"
+        first._write_json(first.sequence_file, first_data)
+        marker = tmp_path / "hook-ran"
+        hook = tmp_path / "post-switch-hook"
+        hook.write_text(
+            "#!/usr/bin/env python3\n"
+            "import pathlib\n"
+            f"pathlib.Path({str(marker)!r}).touch()\n"
+        )
+        hook.chmod(0o755)
+        set_setting(first.backup_dir, "hooks.postSwitch", str(hook))
+        committed = threading.Event()
+        first._perform_switch = self._fake_committing_switch(
+            first, "2", committed,
+        )
+        hook_lock = first.backup_dir / ".post_switch_hook.lock"
+        result = {}
+
+        with FileLock(hook_lock):
+            thread = threading.Thread(
+                target=lambda: result.setdefault(
+                    "value", first.switch_to("2", json_output=True)
+                )
+            )
+            thread.start()
+            assert committed.wait(2)
+            first._write_json(
+                first._get_claude_config_path(),
+                {
+                    "oauthAccount": {
+                        "emailAddress": "account2@example.com",
+                        "organizationUuid": "org-external-login",
+                    }
+                },
+            )
+
+        thread.join(5)
+        assert not thread.is_alive()
+        assert result["value"]["switched"] is True
+        assert first._get_sequence_data()["activeAccountNumber"] == 2
+        assert not marker.exists()
+        assert result["value"]["warnings"] == []
+
+    def test_running_hook_finishes_before_later_switch_hook(
+        self, temp_home, mock_claude_config, sample_sequence_data, tmp_path,
+    ):
+        first, second = self._concurrent_switchers(
+            temp_home, mock_claude_config, sample_sequence_data,
+        )
+        started = tmp_path / "first-started"
+        release = tmp_path / "release-first"
+        calls = tmp_path / "calls"
+        hook = tmp_path / "post-switch-hook"
+        hook.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, pathlib, sys, time\n"
+            "payload = json.load(sys.stdin)\n"
+            "target = payload['to']['number']\n"
+            f"started = pathlib.Path({str(started)!r})\n"
+            f"release = pathlib.Path({str(release)!r})\n"
+            f"calls = pathlib.Path({str(calls)!r})\n"
+            "if target == 2:\n"
+            "    started.touch()\n"
+            "    while not release.exists(): time.sleep(0.01)\n"
+            "old = calls.read_text() if calls.exists() else ''\n"
+            "calls.write_text(old + str(target) + '\\n')\n"
+        )
+        hook.chmod(0o755)
+        set_setting(first.backup_dir, "hooks.postSwitch", str(hook))
+        second_committed = threading.Event()
+        first._perform_switch = self._fake_committing_switch(first, "2")
+        second._perform_switch = self._fake_committing_switch(
+            second, "3", second_committed,
+        )
+
+        thread_a = threading.Thread(
+            target=lambda: first.switch_to("2", json_output=True)
+        )
+        thread_a.start()
+        deadline = time.monotonic() + 3
+        while not started.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert started.exists()
+        thread_b = threading.Thread(
+            target=lambda: second.switch_to("3", json_output=True)
+        )
+        thread_b.start()
+        assert second_committed.wait(2)
+        time.sleep(0.05)
+        assert not calls.exists()
+        release.touch()
+
+        thread_a.join(5)
+        thread_b.join(5)
+        assert not thread_a.is_alive() and not thread_b.is_alive()
+        assert calls.read_text().splitlines() == ["2", "3"]
+
+    def test_inherited_hook_guard_suppresses_nested_public_switch_hook(
+        self, temp_home, mock_claude_config, sample_sequence_data, tmp_path,
+        monkeypatch,
+    ):
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        live_state = {"creds": json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-live-1", "refreshToken": "rt-live-1",
+        }})}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        marker = tmp_path / "hook-ran"
+        hook = tmp_path / "post-switch-hook"
+        hook.write_text(
+            "#!/usr/bin/env python3\n"
+            "import pathlib\n"
+            f"pathlib.Path({str(marker)!r}).touch()\n"
+        )
+        hook.chmod(0o755)
+        set_setting(switcher.backup_dir, "hooks.postSwitch", str(hook))
+        monkeypatch.setenv("CLAUDE_SWAP_POST_SWITCH_HOOK_ACTIVE", "1")
+
+        try:
+            with patch.object(switcher, "list_accounts"):
+                result = switcher.switch_to("2", json_output=True)
+        finally:
+            for p in patches:
+                p.stop()
+
+        assert result["switched"] is True
+        assert not marker.exists()
+
+    def test_hook_child_can_invoke_public_cswap_switch_without_recursive_deadlock(
+        self, temp_home, mock_claude_config, sample_sequence_data, tmp_path,
+    ):
+        switcher, _ = self._concurrent_switchers(
+            temp_home, mock_claude_config, sample_sequence_data,
+        )
+        nested_result = tmp_path / "nested-result.json"
+        nested_code = (
+            "import json, pathlib\n"
+            "from claude_swap.switcher import ClaudeAccountSwitcher\n"
+            "s = ClaudeAccountSwitcher()\n"
+            "def perform(target, **kwargs):\n"
+            "    data = s._get_sequence_data()\n"
+            "    data['activeAccountNumber'] = 3\n"
+            "    s._write_json(s.sequence_file, data)\n"
+            "    return {'from': {'number': 2, 'email': 'account2@example.com'}, "
+            "'to': {'number': 3, 'email': 'account3@example.com'}, 'warnings': []}\n"
+            "s._perform_switch = perform\n"
+            "result = s.switch_to('3', json_output=True)\n"
+            f"pathlib.Path({str(nested_result)!r}).write_text(json.dumps(result))\n"
+        )
+        hook = tmp_path / "post-switch-hook"
+        hook.write_text(
+            "#!/usr/bin/env python3\n"
+            "import subprocess, sys\n"
+            f"raise SystemExit(subprocess.run([sys.executable, '-c', {nested_code!r}]).returncode)\n"
+        )
+        hook.chmod(0o755)
+        set_setting(switcher.backup_dir, "hooks.postSwitch", str(hook))
+        switcher._perform_switch = self._fake_committing_switch(switcher, "2")
+
+        with patch("claude_swap.hooks.POST_SWITCH_TIMEOUT_SECONDS", 2):
+            result = switcher.switch_to("2", json_output=True)
+
+        assert result["warnings"] == []
+        assert json.loads(nested_result.read_text())["switched"] is True
+        assert switcher._get_sequence_data()["activeAccountNumber"] == 3
+
+    def test_hand_edited_relative_hook_never_executes_via_path(
+        self, temp_home, mock_claude_config, sample_sequence_data, tmp_path,
+        monkeypatch,
+    ):
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        live_state = {"creds": json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-live-1", "refreshToken": "rt-live-1",
+        }})}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        marker = tmp_path / "hook-ran"
+        executable = tmp_path / "relative-hook"
+        executable.write_text(
+            "#!/usr/bin/env python3\n"
+            "import pathlib\n"
+            f"pathlib.Path({str(marker)!r}).touch()\n"
+        )
+        executable.chmod(0o755)
+        settings_path(switcher.backup_dir).write_text(json.dumps({
+            "schemaVersion": 1,
+            "hooks": {"postSwitch": "relative-hook"},
+        }))
+        monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ['PATH']}")
+
+        try:
+            with patch.object(switcher, "list_accounts"):
+                result = switcher.switch_to("2", json_output=True)
+        finally:
+            for p in patches:
+                p.stop()
+
+        assert result["switched"] is True
+        assert not marker.exists()
+        assert result["warnings"] == [
+            "Post-switch hook is not an absolute executable path"
+        ]
+
+    def test_public_switch_invokes_hook_exactly_once(
+        self, temp_home, mock_claude_config, sample_sequence_data, tmp_path,
+    ):
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        live_state = {"creds": json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-live-1", "refreshToken": "rt-live-1",
+        }})}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        calls = tmp_path / "calls"
+        hook = tmp_path / "post-switch-hook"
+        hook.write_text(
+            "#!/usr/bin/env python3\n"
+            "import pathlib\n"
+            f"path = pathlib.Path({str(calls)!r})\n"
+            "path.write_text(path.read_text() + 'call\\n' if path.exists() else 'call\\n')\n"
+        )
+        hook.chmod(0o755)
+        set_setting(switcher.backup_dir, "hooks.postSwitch", str(hook))
+
+        try:
+            with patch.object(switcher, "list_accounts"):
+                result = switcher.switch(json_output=True)
+        finally:
+            for p in patches:
+                p.stop()
+
+        assert result["switched"] is True
+        assert calls.read_text().splitlines() == ["call"]
+
+    def test_public_same_account_noop_does_not_invoke_hook(
+        self, temp_home, mock_claude_config, sample_sequence_data, tmp_path,
+    ):
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        matching = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-live-1", "refreshToken": "rt-live-1",
+        }})
+        creds_store[("1", "test@example.com")] = matching
+        live_state = {"creds": matching}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        marker = tmp_path / "hook-ran"
+        hook = tmp_path / "post-switch-hook"
+        hook.write_text(
+            "#!/usr/bin/env python3\n"
+            "import pathlib\n"
+            f"pathlib.Path({str(marker)!r}).touch()\n"
+        )
+        hook.chmod(0o755)
+        set_setting(switcher.backup_dir, "hooks.postSwitch", str(hook))
+
+        try:
+            result = switcher.switch_to("1", json_output=True)
+        finally:
+            for p in patches:
+                p.stop()
+
+        assert result["reason"] == "already-active"
+        assert not marker.exists()
+
+    def test_nonzero_hook_preserves_switch_and_adds_json_warning(
+        self, temp_home, mock_claude_config, sample_sequence_data, tmp_path,
+    ):
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        live_state = {"creds": json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-live-1", "refreshToken": "rt-live-1",
+        }})}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        hook = tmp_path / "post-switch-hook"
+        hook.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys\n"
+            "print('brief failure', file=sys.stderr)\n"
+            "print('must not be shown', file=sys.stderr)\n"
+            "raise SystemExit(7)\n"
+        )
+        hook.chmod(0o755)
+        set_setting(switcher.backup_dir, "hooks.postSwitch", str(hook))
+
+        try:
+            with patch.object(switcher, "list_accounts"):
+                result = switcher.switch_to("2", json_output=True)
+        finally:
+            for p in patches:
+                p.stop()
+
+        assert result["switched"] is True
+        assert switcher._get_sequence_data()["activeAccountNumber"] == 2
+        assert result["warnings"] == [
+            "Post-switch hook exited with status 7: brief failure"
+        ]
+
+    def test_nonzero_hook_warns_in_human_mode(
+        self, temp_home, mock_claude_config, sample_sequence_data, tmp_path, capsys,
+    ):
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        live_state = {"creds": json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-live-1", "refreshToken": "rt-live-1",
+        }})}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        hook = tmp_path / "post-switch-hook"
+        hook.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys\n"
+            "print('brief failure', file=sys.stderr)\n"
+            "raise SystemExit(7)\n"
+        )
+        hook.chmod(0o755)
+        set_setting(switcher.backup_dir, "hooks.postSwitch", str(hook))
+
+        try:
+            with patch.object(switcher, "list_accounts"):
+                result = switcher.switch_to("2")
+        finally:
+            for p in patches:
+                p.stop()
+
+        output = capsys.readouterr().out
+        assert result is None
+        assert "Switched to Account-2" in output
+        assert "Post-switch hook exited with status 7: brief failure" in output
+        assert switcher._get_sequence_data()["activeAccountNumber"] == 2
+
+    def test_unexpected_hook_value_error_cannot_change_committed_switch(
+        self, temp_home, mock_claude_config, sample_sequence_data, tmp_path,
+    ):
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        live_state = {"creds": json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-live-1", "refreshToken": "rt-live-1",
+        }})}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        hook = tmp_path / "post-switch-hook"
+        hook.write_text("#!/bin/sh\nexit 0\n")
+        hook.chmod(0o755)
+        set_setting(switcher.backup_dir, "hooks.postSwitch", str(hook))
+
+        try:
+            with patch.object(switcher, "list_accounts"), patch(
+                "claude_swap.switcher.run_post_switch_hook",
+                side_effect=ValueError("bad launch value"),
+            ):
+                result = switcher.switch_to("2", json_output=True)
+        finally:
+            for p in patches:
+                p.stop()
+
+        assert result["switched"] is True
+        assert switcher._get_sequence_data()["activeAccountNumber"] == 2
+        assert result["warnings"] == [
+            "Post-switch hook failed: ValueError: bad launch value"
+        ]
+
+    def test_missing_hook_after_configuration_preserves_switch_with_warning(
+        self, temp_home, mock_claude_config, sample_sequence_data, tmp_path,
+    ):
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        live_state = {"creds": json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-live-1", "refreshToken": "rt-live-1",
+        }})}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        hook = tmp_path / "post-switch-hook"
+        hook.write_text("#!/bin/sh\nexit 0\n")
+        hook.chmod(0o755)
+        set_setting(switcher.backup_dir, "hooks.postSwitch", str(hook))
+        hook.unlink()
+
+        try:
+            with patch.object(switcher, "list_accounts"):
+                result = switcher.switch_to("2", json_output=True)
+        finally:
+            for p in patches:
+                p.stop()
+
+        assert result["switched"] is True
+        assert result["warnings"] == [
+            "Post-switch hook executable does not exist"
+        ]
+        assert switcher._get_sequence_data()["activeAccountNumber"] == 2
+
+    def test_timed_out_hook_preserves_switch_with_warning(
+        self, temp_home, mock_claude_config, sample_sequence_data, tmp_path,
+    ):
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        live_state = {"creds": json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-live-1", "refreshToken": "rt-live-1",
+        }})}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        hook = tmp_path / "post-switch-hook"
+        hook.write_text(
+            "#!/usr/bin/env python3\n"
+            "import time\n"
+            "time.sleep(5)\n"
+        )
+        hook.chmod(0o755)
+        set_setting(switcher.backup_dir, "hooks.postSwitch", str(hook))
+
+        try:
+            with patch.object(switcher, "list_accounts"), patch(
+                "claude_swap.hooks.POST_SWITCH_TIMEOUT_SECONDS", 0.05,
+            ):
+                result = switcher.switch_to("2", json_output=True)
+        finally:
+            for p in patches:
+                p.stop()
+
+        assert result["switched"] is True
+        assert result["warnings"] == [
+            "Post-switch hook timed out after 10 seconds"
+        ]
+        assert switcher._get_sequence_data()["activeAccountNumber"] == 2
+
+    def test_external_hook_can_acquire_all_native_switch_locks(
+        self, temp_home, mock_claude_config, sample_sequence_data, tmp_path,
+    ):
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        live_state = {"creds": json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-live-1", "refreshToken": "rt-live-1",
+        }})}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        marker = tmp_path / "locks-acquired"
+        hook = tmp_path / "post-switch-hook"
+        lock_dirs = [
+            oauth_refresh_lock_dir(), credentials_lock_dir(), config_lock_dir(),
+        ]
+        hook.write_text(
+            "#!/usr/bin/env python3\n"
+            "import fcntl, os, pathlib\n"
+            f"account_lock = pathlib.Path({str(switcher.lock_file)!r})\n"
+            f"lock_dirs = {[str(path) for path in lock_dirs]!r}\n"
+            "account_lock.parent.mkdir(parents=True, exist_ok=True)\n"
+            "handle = account_lock.open('w')\n"
+            "created = []\n"
+            "try:\n"
+            "    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+            "    for lock_dir in lock_dirs:\n"
+            "        os.mkdir(lock_dir)\n"
+            "        created.append(lock_dir)\n"
+            f"    pathlib.Path({str(marker)!r}).write_text('ok')\n"
+            "finally:\n"
+            "    for lock_dir in reversed(created):\n"
+            "        os.rmdir(lock_dir)\n"
+            "    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)\n"
+            "    handle.close()\n"
+        )
+        hook.chmod(0o755)
+        set_setting(switcher.backup_dir, "hooks.postSwitch", str(hook))
+
+        try:
+            with patch.object(switcher, "list_accounts"):
+                result = switcher.switch_to("2", json_output=True)
+        finally:
+            for p in patches:
+                p.stop()
+
+        assert result["warnings"] == []
+        assert marker.read_text() == "ok"
+
+    def test_direct_activation_without_live_account_runs_hook_after_locks(
+        self, temp_home, mock_claude_config, sample_sequence_data, tmp_path,
+    ):
+        mock_claude_config.write_text("{}")
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        live_state = {"creds": ""}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        received = tmp_path / "hook-input.json"
+        hook = tmp_path / "post-switch-hook"
+        hook.write_text(
+            "#!/usr/bin/env python3\n"
+            "import fcntl, json, pathlib, sys\n"
+            f"lock_path = pathlib.Path({str(switcher.lock_file)!r})\n"
+            "handle = lock_path.open('w')\n"
+            "fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+            f"pathlib.Path({str(received)!r}).write_bytes(sys.stdin.buffer.read())\n"
+            "fcntl.flock(handle.fileno(), fcntl.LOCK_UN)\n"
+        )
+        hook.chmod(0o755)
+        set_setting(switcher.backup_dir, "hooks.postSwitch", str(hook))
+
+        try:
+            result = switcher.switch_to("2", json_output=True)
+        finally:
+            for p in patches:
+                p.stop()
+
+        assert result["switched"] is True
+        assert json.loads(received.read_text()) == {
+            "schemaVersion": 1,
+            "event": "postSwitch",
+            "from": None,
+            "to": {"number": 2, "email": "account2@example.com"},
+        }
+
+    def test_forced_same_account_activation_does_not_run_hook(
+        self, temp_home, mock_claude_config, sample_sequence_data, tmp_path,
+    ):
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        stored = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-stored-1", "refreshToken": "rt-stored-1",
+        }})
+        creds_store[("1", "test@example.com")] = stored
+        configs_store[("1", "test@example.com")] = json.dumps({
+            "oauthAccount": {
+                "emailAddress": "test@example.com",
+                "accountUuid": "test-uuid-1234",
+            },
+        })
+        live_state = {"creds": json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-stale", "refreshToken": "rt-stale",
+        }})}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        marker = tmp_path / "hook-ran"
+        hook = tmp_path / "post-switch-hook"
+        hook.write_text(
+            "#!/usr/bin/env python3\n"
+            "import pathlib\n"
+            f"pathlib.Path({str(marker)!r}).touch()\n"
+        )
+        hook.chmod(0o755)
+        set_setting(switcher.backup_dir, "hooks.postSwitch", str(hook))
+
+        try:
+            result = switcher.switch_to("1", json_output=True, force=True)
+        finally:
+            for p in patches:
+                p.stop()
+
+        assert result["reason"] == "activated"
+        assert live_state["creds"] == stored
+        assert not marker.exists()
 
 
 class TestSelfSwitchProvenance:

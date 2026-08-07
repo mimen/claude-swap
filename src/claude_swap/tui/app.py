@@ -272,6 +272,19 @@ class CswapApp(App):
                 to = payload.get("to") or {}
                 target = to.get("email") or f"account {to.get('number')}"
                 self.notify(f"Switched to {target}", title="Switch")
+                warnings = payload.get("warnings")
+                warning_messages = (
+                    [item for item in warnings if isinstance(item, str) and item]
+                    if isinstance(warnings, list)
+                    else []
+                )
+                if warning_messages:
+                    self.notify(
+                        " ".join(warning_messages),
+                        title="Switch warning",
+                        severity="warning",
+                        timeout=8,
+                    )
             else:
                 reason = str(payload.get("reason") or "no switch performed")
                 self.notify(reason, title="No switch", severity="warning")

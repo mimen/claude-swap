@@ -420,7 +420,8 @@ def test_auto_switch_event_renders_and_notifies_credential_drift_warning(tmp_pat
     )
 
     assert messages[0][0] == "Auto-switch warning"
-    assert messages[0][1].startswith(warning)
+    assert messages[0][1].count(warning) == 1
+    assert messages[0][1].endswith(f"Warning: {warning}")
     assert notifications == [messages[0]]
     controller.stop()
 

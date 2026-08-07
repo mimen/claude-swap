@@ -67,7 +67,18 @@ class UiSettings:
     theme: str = "auto"
 
 
-_SECTION_DEFAULT_SOURCES = {"autoswitch": AutoSwitchSettings, "ui": UiSettings}
+@dataclass(frozen=True)
+class HooksSettings:
+    """Executable hooks run after claude-swap operations."""
+
+    post_switch: str | None = None
+
+
+_SECTION_DEFAULT_SOURCES = {
+    "autoswitch": AutoSwitchSettings,
+    "ui": UiSettings,
+    "hooks": HooksSettings,
+}
 
 
 @dataclass(frozen=True)
@@ -82,7 +93,7 @@ class SettingSpec:
     section: str  # top-level JSON section ("autoswitch", "ui")
     json_key: str  # camelCase key inside the section
     field: str  # snake_case AutoSwitchSettings field
-    kind: str  # "float" | "int" | "bool" | "choice"
+    kind: str  # "float" | "int" | "bool" | "choice" | "string" | "executable_path"
     lo: float | None = None
     hi: float | None = None
     choices: tuple[str, ...] = ()
@@ -138,6 +149,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),
             help="Color theme; auto follows the terminal background",
+        ),
+        SettingSpec(
+            "hooks", "postSwitch", "post_switch", "executable_path",
+            help="Absolute path to an executable run after an account identity change",
         ),
     )
 }
@@ -248,6 +263,18 @@ def load_ui_settings(backup_root: Path) -> UiSettings:
     return UiSettings(theme=theme)
 
 
+def load_hooks_settings(backup_root: Path) -> HooksSettings:
+    """Load executable hook paths; missing or malformed values disable hooks."""
+    raw = _read_raw(settings_path(backup_root))
+    section = raw.get("hooks")
+    if not isinstance(section, dict):
+        return HooksSettings()
+    post_switch = section.get("postSwitch")
+    if not isinstance(post_switch, str) or not post_switch:
+        return HooksSettings()
+    return HooksSettings(post_switch=post_switch)
+
+
 def save_settings(backup_root: Path, settings: AutoSwitchSettings) -> None:
     """Write the autoswitch section, preserving unknown keys and sections."""
     path = settings_path(backup_root)
@@ -301,13 +328,21 @@ def parse_setting_value(spec: SettingSpec, raw_value: str):
                 f"{spec.dotted} must be one of: {', '.join(spec.choices)}"
             )
         return raw_value
-    if spec.kind == "string":
+    if spec.kind in ("string", "executable_path"):
         value = raw_value.strip()
         if not value:
             raise ConfigError(
                 f"{spec.dotted} expects a non-empty value; use "
                 f"'cswap config unset {spec.dotted}' to clear it"
             )
+        if spec.kind == "executable_path":
+            if "\x00" in value:
+                raise ConfigError(f"{spec.dotted} path contains an embedded NUL")
+            path = Path(value)
+            if not path.is_absolute():
+                raise ConfigError(f"{spec.dotted} expects an absolute path")
+            if not path.is_file() or not os.access(path, os.X_OK):
+                raise ConfigError(f"{spec.dotted} path is not an executable file: {value}")
         return value
     try:
         value = int(raw_value) if spec.kind == "int" else float(raw_value)
@@ -412,6 +447,7 @@ def effective_settings(backup_root: Path) -> list[tuple[SettingSpec, object, boo
     loaded = {
         "autoswitch": load_settings(backup_root),
         "ui": load_ui_settings(backup_root),
+        "hooks": load_hooks_settings(backup_root),
     }
     rows = []
     for spec in SETTING_SPECS.values():

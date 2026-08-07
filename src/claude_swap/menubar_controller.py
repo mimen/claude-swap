@@ -668,7 +668,6 @@ class MenuBarController:
             )
             detail = event.human()
             if warning_messages:
-                detail = f"{' '.join(warning_messages)} {detail}"
                 title = "Auto-switch warning"
             else:
                 title = "Auto-switched account"
