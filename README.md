@@ -274,11 +274,23 @@ cswap config                              # list effective settings ("(default)"
 cswap config get autoswitch.threshold
 cswap config set autoswitch.threshold 80  # validated: rejects out-of-range values loudly
 cswap config set autoswitch.model Fable   # per-model switching (see "auto"); Fable,Opus for several
+cswap config set hooks.postSwitch /absolute/path/to/executable
+cswap config unset hooks.postSwitch       # disable the post-switch hook
 cswap config unset autoswitch.threshold   # back to the default
 cswap config path                         # where settings.json lives
 ```
 
-`cswap config --help` lists every key with its valid range and default. Hand-editing the file still works — `cswap config` is just a safer front door. `list` and `get` take `--json` for scripting.
+`hooks.postSwitch` is one absolute executable path, not a shell command. After a successful switch that changes the active account identity, claude-swap starts it directly with no shell and writes this compact JSON object to stdin:
+
+```json
+{"schemaVersion":1,"event":"postSwitch","from":{"number":1,"email":"old@example.com"},"to":{"number":2,"email":"new@example.com"}}
+```
+
+`from` is `null` when activating an account with no prior live account. The hook runs after claude-swap and Claude credential/config locks are released. Concurrent hooks are ordered, and a waiting hook is skipped when either a newer switch or an external `/login` has changed Claude's local live identity. It has a 10-second timeout. Hook launch errors, timeouts, and nonzero exits produce a warning but do not undo the completed switch. Descendant cleanup is best-effort, including on Windows. No-op and same-account activations do not run it.
+
+The child inherits `CLAUDE_SWAP_POST_SWITCH_HOOK_ACTIVE=1`. A nested `cswap` invocation may still switch accounts, but it suppresses another post-switch hook so a hook cannot recursively wait on its own ordering lock.
+
+`cswap config --help` lists every key with its valid range and default. Hand-editing the file still works; `cswap config` is just a safer front door. `list` and `get` take `--json` for scripting.
 
 </details>
 

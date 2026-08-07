@@ -49,9 +49,10 @@ class TestConfigList:
             "autoswitch.unhealthyTicks",
             "autoswitch.model",
             "ui.theme",
+            "hooks.postSwitch",
         ):
             assert key in out
-        assert out.count("(default)") == 9
+        assert out.count("(default)") == 10
 
     def test_set_key_not_marked_default(self, temp_home, capsys):
         _run(["set", "autoswitch.cooldownSeconds", "600"], capsys)
@@ -78,7 +79,7 @@ class TestConfigList:
         assert payload["schemaVersion"] == 1
         assert payload["path"].endswith("settings.json")
         by_key = {entry["key"]: entry for entry in payload["settings"]}
-        assert len(by_key) == 9
+        assert len(by_key) == 10
         assert by_key["autoswitch.threshold"]["value"] == 90.0
         assert by_key["autoswitch.threshold"]["isSet"] is False
         assert by_key["autoswitch.includeApiKeyAccounts"]["value"] is False
@@ -92,6 +93,24 @@ class TestConfigSetGet:
         code, out, _ = _run(["get", "autoswitch.threshold"], capsys)
         assert code == 0
         assert out.strip() == "80"
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX executable mode")
+    def test_set_and_unset_post_switch_hook(self, temp_home, capsys, tmp_path):
+        executable = tmp_path / "hook"
+        executable.write_text("#!/bin/sh\nexit 0\n")
+        executable.chmod(0o755)
+
+        code, out, _ = _run(
+            ["set", "hooks.postSwitch", str(executable)], capsys
+        )
+        assert code == 0
+        assert f"hooks.postSwitch = {executable}" in out
+        raw = json.loads(_settings_file(capsys).read_text())
+        assert raw["hooks"]["postSwitch"] == str(executable)
+
+        code, _, _ = _run(["unset", "hooks.postSwitch"], capsys)
+        assert code == 0
+        assert "hooks" not in json.loads(_settings_file(capsys).read_text())
 
     def test_set_writes_only_that_key(self, temp_home, capsys):
         """The trap guard: no other defaults get materialized into the file."""
