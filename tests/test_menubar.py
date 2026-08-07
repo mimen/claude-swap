@@ -11,7 +11,6 @@ from __future__ import annotations
 import datetime as _dt
 import json
 import plistlib
-import sys
 from pathlib import Path
 
 import pytest
@@ -22,6 +21,7 @@ from claude_swap.switcher import USAGE_API_KEY
 
 
 # --- notification identity -----------------------------------------------------
+
 
 def test_notification_identity_creates_and_preserves_info_plist(tmp_path: Path):
     executable = tmp_path / "bin" / "python3"
@@ -42,7 +42,6 @@ def test_notification_identity_heals_corrupt_info_plist(tmp_path: Path):
     executable = tmp_path / "bin" / "python3"
     executable.parent.mkdir()
     info = executable.parent / "Info.plist"
-    # truncated XML plist: plistlib raises ExpatError, not InvalidFileException
     info.write_bytes(
         b'<?xml version="1.0" encoding="UTF-8"?>\n'
         b'<plist version="1.0"><dict><key>CFBundle'
@@ -69,8 +68,6 @@ def test_notification_identity_is_noop_off_macos(tmp_path: Path):
 
 def test_settings_defaults_when_file_missing(tmp_path: Path):
     s = menubar.MenuBarSettings.load(tmp_path / "nope.json")
-    assert s.show_account_name is True
-    assert s.title_pct == "both"
     assert s.refresh_interval == 60
     assert s.auto_switch_enabled is False
 
@@ -78,8 +75,6 @@ def test_settings_defaults_when_file_missing(tmp_path: Path):
 def test_settings_round_trip(tmp_path: Path):
     path = tmp_path / "menubar_settings.json"
     original = menubar.MenuBarSettings(
-        show_account_name=False,
-        title_pct="5h",
         refresh_interval=300,
         auto_switch_enabled=True,
     )
@@ -104,9 +99,9 @@ def test_settings_ignores_unknown_and_bad_types(tmp_path: Path):
         encoding="utf-8",
     )
     s = menubar.MenuBarSettings.load(path)
-    # bad-typed refresh_interval falls back to default; valid bool is kept
+    # Bad-typed refresh_interval and removed display keys fall back cleanly.
     assert s.refresh_interval == 60
-    assert s.show_account_name is False
+    assert s == menubar.MenuBarSettings()
 
 
 _USAGE = {
@@ -277,90 +272,41 @@ def test_usage_log_key_ignores_clock_tracks_pct():
 
 # --- title ---------------------------------------------------------------------
 
-def test_format_title_name_and_5h():
-    s = menubar.MenuBarSettings(show_account_name=True, title_pct="5h")
-    assert menubar.format_title("loc@papaya.asia", _USAGE, s) == "⇄ loc · 42%"
+def test_format_title_ignores_account_identity_and_shows_usage_windows():
+    s = menubar.MenuBarSettings()
+    assert menubar.format_title("loc@papaya.asia", _USAGE, s, alias="dev") == "42% / 18%"
 
 
-def test_format_title_prefers_alias_over_local_part():
-    s = menubar.MenuBarSettings(show_account_name=True, title_pct="off")
-    assert menubar.format_title("loc@papaya.asia", _USAGE, s, alias="dev") == "⇄ dev"
-
-
-def test_format_title_name_only_when_pct_off():
-    s = menubar.MenuBarSettings(show_account_name=True, title_pct="off")
-    assert menubar.format_title("loc@papaya.asia", _USAGE, s) == "⇄ loc"
-
-
-def test_format_title_5h_only():
-    s = menubar.MenuBarSettings(show_account_name=False, title_pct="5h")
-    assert menubar.format_title("loc@papaya.asia", _USAGE, s) == "⇄ 42%"
-
-
-def test_format_title_7d_only():
-    s = menubar.MenuBarSettings(show_account_name=False, title_pct="7d")
-    assert menubar.format_title("loc@papaya.asia", _USAGE, s) == "⇄ 18%"
-
-
-def test_format_title_both_windows():
-    s = menubar.MenuBarSettings(show_account_name=False, title_pct="both")
-    assert menubar.format_title("loc@papaya.asia", _USAGE, s) == "⇄ 42% · 18%"
-
-
-def test_format_title_both_windows_with_name():
-    s = menubar.MenuBarSettings(show_account_name=True, title_pct="both")
-    assert menubar.format_title("loc@papaya.asia", _USAGE, s) == "⇄ loc · 42% · 18%"
-
-
-def test_format_title_icon_only_when_off():
-    s = menubar.MenuBarSettings(show_account_name=False, title_pct="off")
-    assert menubar.format_title("loc@papaya.asia", _USAGE, s) == "⇄"
-
-
-def test_format_title_scoped_appends_model_limits():
-    # title_pct="off" + title_scoped gives a title tracking only the scoped model
-    s = menubar.MenuBarSettings(show_account_name=True, title_pct="off", title_scoped=True)
+def test_format_title_adds_scoped_percentage_without_its_label():
+    s = menubar.MenuBarSettings()
     usage = {**_USAGE, "scoped": [{"name": "Fable", "pct": 55.0}]}
-    assert menubar.format_title("loc@papaya.asia", usage, s) == "⇄ loc · Fable 55%"
+    assert menubar.format_title("loc@papaya.asia", usage, s) == "42% / 18% / 55%"
 
 
-def test_format_title_scoped_after_windows_multiple_models():
-    s = menubar.MenuBarSettings(show_account_name=False, title_pct="both", title_scoped=True)
+def test_format_title_keeps_at_most_one_scoped_percentage():
     usage = {
         **_USAGE,
         "scoped": [{"name": "Fable", "pct": 55.0}, {"name": "Opus", "pct": 7.0}],
     }
-    assert menubar.format_title("loc@papaya.asia", usage, s) == "⇄ 42% · 18% · Fable 55% · Opus 7%"
+    assert menubar.format_title(
+        "loc@papaya.asia", usage, menubar.MenuBarSettings()
+    ) == "42% / 18% / 55%"
 
 
-def test_format_title_scoped_off_by_default():
-    # default settings ignore scoped windows entirely
-    s = menubar.MenuBarSettings(show_account_name=False, title_pct="off")
-    usage = {**_USAGE, "scoped": [{"name": "Fable", "pct": 55.0}]}
-    assert not s.title_scoped
-    assert menubar.format_title("loc@papaya.asia", usage, s) == "⇄"
+def test_format_title_empty_when_no_active_account():
+    assert menubar.format_title(None, None, menubar.MenuBarSettings()) == ""
 
 
-def test_format_title_icon_only_when_no_active_account():
-    s = menubar.MenuBarSettings(show_account_name=True, title_pct="both")
-    assert menubar.format_title(None, None, s) == "⇄"
+def test_format_title_drops_unavailable_windows():
+    assert menubar.format_title(
+        "loc@x.com", "no credentials", menubar.MenuBarSettings()
+    ) == ""
 
 
-def test_format_title_truncates_long_local_part():
-    s = menubar.MenuBarSettings(show_account_name=True, title_pct="off")
-    title = menubar.format_title("averylonglocalpart@example.com", None, s)
-    assert title == "⇄ averylonglo*"  # 12 chars: 11 letters + asterisk marker
-
-
-def test_format_title_both_drops_unavailable_windows():
-    s = menubar.MenuBarSettings(show_account_name=False, title_pct="both")
-    assert menubar.format_title("loc@x.com", "no credentials", s) == "⇄"
-
-
-def test_format_title_both_keeps_available_window():
-    s = menubar.MenuBarSettings(show_account_name=False, title_pct="both")
-    # only 5h present -> 7d dropped, no trailing separator
-    assert menubar.format_title("loc@x.com", {"five_hour": {"pct": 9.0}}, s) == "⇄ 9%"
+def test_format_title_keeps_each_available_window_without_trailing_separator():
+    assert menubar.format_title(
+        "loc@x.com", {"five_hour": {"pct": 9.0}}, menubar.MenuBarSettings()
+    ) == "9%"
 
 
 # --- reset-time helpers --------------------------------------------------------
@@ -537,22 +483,17 @@ def test_usage_summary_scoped_reflects_passed_weekly_reset():
 
 
 def test_format_title_reflects_passed_weekly_reset():
-    s = menubar.MenuBarSettings(show_account_name=False, title_pct="7d")
+    s = menubar.MenuBarSettings()
     usage = {"seven_day": {"pct": 95.0, "resets_at": _iso(-86400)}}
-    assert menubar.format_title("a@x.com", usage, s, _NOW) == "⇄ 0%"
+    assert menubar.format_title("a@x.com", usage, s, _NOW) == "0%"
 
 
 # --- run() app glue ------------------------------------------------------------
 
-def test_run_without_rumps_raises_clean_error(monkeypatch):
-    """A missing menubar extra surfaces as ClaudeSwitchError, not a traceback.
+def test_run_without_appkit_raises_clean_error(monkeypatch):
+    """A missing native AppKit runtime surfaces as ClaudeSwitchError."""
+    from claude_swap import menubar_appkit
 
-    The module is import-safe without rumps, so the CLI's ImportError guard
-    around ``from claude_swap.menubar import run`` can never fire — the import
-    failure happens inside ``run()``. Blocking the import (a ``None`` entry in
-    ``sys.modules`` makes ``import rumps`` raise) checks that ``run()`` turns
-    it into the error type the CLI renders with the install hint.
-    """
-    monkeypatch.setitem(sys.modules, "rumps", None)
+    monkeypatch.setattr(menubar_appkit, "APPKIT_AVAILABLE", False)
     with pytest.raises(ClaudeSwitchError, match=r"claude-swap\[menubar\]"):
         menubar.run(switcher=None)
