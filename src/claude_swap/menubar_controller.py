@@ -241,25 +241,6 @@ class MenuBarController:
         """Reveal the log in Finder on the serialized worker."""
         self._submit(lambda: self.reveal_log(self.log_path), self._mutation_failed)
 
-    def update_title_preferences(
-        self,
-        *,
-        show_account_name: bool | None = None,
-        title_pct: str | None = None,
-        title_scoped: bool | None = None,
-    ) -> None:
-        """Persist display preferences and update the native title asynchronously."""
-        def save() -> None:
-            if show_account_name is not None:
-                self.settings.show_account_name = show_account_name
-            if title_pct is not None:
-                self.settings.title_pct = title_pct
-            if title_scoped is not None:
-                self.settings.title_scoped = title_scoped
-            self.settings.save(self.settings_path)
-
-        self._submit(save, self._settings_failed)
-
     def set_refresh_interval(self, seconds: int) -> None:
         """Persist a validated refresh cadence; the UI owns timer replacement."""
         def save() -> None:

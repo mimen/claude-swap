@@ -78,7 +78,7 @@ class NativeMenuBarAppKitSmokeTests(unittest.TestCase):
             def __init__(self, *_args, **_kwargs) -> None:
                 self.settings = MenuBarSettings()
                 self.view_model = model
-                self.title = "⇄"
+                self.title = "40% / 60% / 20%"
                 self.history = []
 
             def bind_ui(self, renderer, _message) -> None:
@@ -118,11 +118,34 @@ class NativeMenuBarAppKitSmokeTests(unittest.TestCase):
         status_bar = AppKit.NSStatusBar.systemStatusBar()
         item = status_bar.statusItemWithLength_(AppKit.NSVariableStatusItemLength)
         try:
-            item.button().setTitle_("⇄")
-            self.assertEqual(item.button().title(), "⇄")
+            button = item.button()
+            button.setImage_(menubar_appkit._claude_icon())
+            menubar_appkit._set_status_title(button, "40% / 60% / 20%")
+            self.assertTrue(button.image().isTemplate())
+            self.assertEqual(button.attributedTitle().string(), "  40% / 60% / 20%")
         finally:
             status_bar.removeStatusItem_(item)
         self.assertIsNotNone(application)
+
+    def test_status_item_falls_back_when_packaged_icon_is_unavailable(self) -> None:
+        with patch.object(menubar_appkit, "files", side_effect=FileNotFoundError):
+            icon = menubar_appkit._claude_icon()
+        self.assertIsNotNone(icon)
+        self.assertTrue(icon.isTemplate())
+
+    def test_status_title_uses_battery_scale_monospaced_digits(self) -> None:
+        import AppKit
+
+        font = menubar_appkit._status_title_font()
+        self.assertEqual(font.pointSize(), AppKit.NSFont.smallSystemFontSize())
+        self.assertIn("Regular", font.displayName())
+
+    def test_native_host_adds_a_small_explicit_icon_title_gap(self) -> None:
+        _application, host = self._host(_model(1))
+        button = host.status_item.button()
+        if button.respondsToSelector_("imageHugsTitle"):
+            self.assertTrue(button.imageHugsTitle())
+        self.assertTrue(button.attributedTitle().string().startswith("  "))
 
     def test_native_popover_constructs_fixed_chrome_and_flipped_accounts_document(self) -> None:
         """The main screen keeps only account groups inside its scroll view."""

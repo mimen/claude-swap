@@ -8,6 +8,7 @@ Linux, Windows, or a macOS Python without the menu-bar extra remains safe; only
 from __future__ import annotations
 
 from collections.abc import Callable
+from importlib.resources import files
 from typing import TYPE_CHECKING
 
 from claude_swap.exceptions import ClaudeSwitchError
@@ -22,9 +23,7 @@ from claude_swap.menubar_layout import (
 from claude_swap.menubar_controller import MenuBarController
 from claude_swap.menubar_viewmodel import (
     AUTO_THRESHOLD_CHOICES,
-    ICON,
     REFRESH_CHOICES,
-    TITLE_PCT_CHOICES,
     CapacityState,
     MenuBarPopoverViewModel,
     PopoverAccountViewModel,
@@ -62,6 +61,47 @@ def _bar(percent: float) -> str:
     """Render a dense text meter for the intentionally TUI-like popover."""
     filled = min(12, max(0, round(percent * 12 / 100)))
     return "█" * filled + "░" * (12 - filled)
+
+
+def _claude_icon():
+    """Load the Claude mark as a template image that follows menu-bar tinting."""
+    image = None
+    try:
+        payload = files("claude_swap").joinpath("assets/claude.svg").read_bytes()
+    except OSError:
+        pass
+    else:
+        data = Foundation.NSData.dataWithBytes_length_(payload, len(payload))
+        image = AppKit.NSImage.alloc().initWithData_(data)
+    if image is None:
+        symbol_image = getattr(
+            AppKit.NSImage,
+            "imageWithSystemSymbolName_accessibilityDescription_",
+            None,
+        )
+        if symbol_image is not None:
+            image = symbol_image("asterisk", "Claude")
+    if image is None:
+        image = AppKit.NSImage.alloc().initWithSize_(AppKit.NSMakeSize(16.0, 16.0))
+    image.setSize_(AppKit.NSMakeSize(16.0, 16.0))
+    image.setTemplate_(True)
+    return image
+
+
+def _status_title_font():
+    """Use the smaller native control size with stable battery-style digits."""
+    return AppKit.NSFont.monospacedDigitSystemFontOfSize_weight_(
+        AppKit.NSFont.smallSystemFontSize(), AppKit.NSFontWeightRegular
+    )
+
+
+def _set_status_title(button, title: str) -> None:
+    display_title = f"  {title}" if title else ""
+    attributed_title = Foundation.NSAttributedString.alloc().initWithString_attributes_(
+        display_title,
+        {AppKit.NSFontAttributeName: _status_title_font()},
+    )
+    button.setAttributedTitle_(attributed_title)
 
 
 def _create_native_menubar(switcher: ClaudeAccountSwitcher):
@@ -322,30 +362,23 @@ def _create_native_menubar(switcher: ClaudeAccountSwitcher):
 
         @objc.python_method
         def _settings(self, document) -> None:
-            layout = plan_scroll_screen((BUTTON_HEIGHT, 64.0, 64.0, 64.0, BUTTON_HEIGHT))
-            self._render_secondary_header(document, layout, "DISPLAY AND AUTO-SWITCH", "Selections save immediately")
-            toggle, scoped = self._button_pair(layout.items[0])
+            layout = plan_scroll_screen((38.0, 64.0, 64.0, BUTTON_HEIGHT))
+            self._render_secondary_header(
+                document,
+                layout,
+                "DISPLAY AND AUTO-SWITCH",
+                "Usage display is fixed; controls save immediately",
+            )
             settings = self.host.controller.settings
-            toggle_title = "Hide account name" if settings.show_account_name else "Show account name"
-            scoped_title = "Hide model limits" if settings.title_scoped else "Show model limits"
-            document.addSubview_(self._button(toggle_title, "toggleAccountName:", toggle))
-            document.addSubview_(self._button(scoped_title, "toggleScoped:", scoped))
-
-            title_section = layout.items[1]
-            document.addSubview_(self._label("Title percentage", Rect(title_section.x, title_section.y, 180.0, 18.0), dim=True))
-            for index, mode in enumerate(TITLE_PCT_CHOICES):
-                title = {"off": "Off", "5h": "5h", "7d": "7d", "both": "Both"}[mode]
-                mark = "✓ " if settings.title_pct == mode else ""
-                document.addSubview_(
-                    self._button(
-                        mark + title,
-                        "setTitlePercent:",
-                        Rect(14.0 + index * 99.0, title_section.y + 24.0, 91.0, BUTTON_HEIGHT),
-                        slot=mode,
-                    )
+            document.addSubview_(
+                self._label(
+                    "Claude icon · 5h / 7d / model percentages",
+                    Rect(layout.items[0].x, layout.items[0].y + 7.0, layout.items[0].width, 18.0),
+                    dim=True,
                 )
+            )
 
-            refresh_section = layout.items[2]
+            refresh_section = layout.items[1]
             document.addSubview_(self._label("Snapshot refresh", Rect(refresh_section.x, refresh_section.y, 180.0, 18.0), dim=True))
             for index, seconds in enumerate(REFRESH_CHOICES):
                 mark = "✓ " if settings.refresh_interval == seconds else ""
@@ -359,7 +392,7 @@ def _create_native_menubar(switcher: ClaudeAccountSwitcher):
                     )
                 )
 
-            auto_section = layout.items[3]
+            auto_section = layout.items[2]
             enabled = settings.auto_switch_enabled
             auto_title = "Auto-switch: on" if enabled else "Auto-switch: off"
             document.addSubview_(
@@ -379,7 +412,7 @@ def _create_native_menubar(switcher: ClaudeAccountSwitcher):
                         slot=str(percent),
                     )
                 )
-            document.addSubview_(self._button("Back", "showMain:", layout.items[4]))
+            document.addSubview_(self._button("Back", "showMain:", layout.items[3]))
 
         @objc.python_method
         def _history(self, document) -> None:
@@ -416,7 +449,7 @@ def _create_native_menubar(switcher: ClaudeAccountSwitcher):
             if screen == "overflow":
                 item_heights = [34.0 for _ in model.accounts] + [BUTTON_HEIGHT] * 4
             elif screen == "settings":
-                item_heights = [BUTTON_HEIGHT, 64.0, 64.0, 64.0, BUTTON_HEIGHT]
+                item_heights = [38.0, 64.0, 64.0, BUTTON_HEIGHT]
             else:
                 entries = self.host.controller.history
                 item_heights = [22.0 for _ in entries] if entries else [22.0]
@@ -450,7 +483,14 @@ def _create_native_menubar(switcher: ClaudeAccountSwitcher):
                 AppKit.NSVariableStatusItemLength
             )
             button = self.status_item.button()
-            button.setTitle_(ICON)
+            button.setImage_(_claude_icon())
+            button.setImagePosition_(AppKit.NSImageLeft)
+            button.setImageScaling_(AppKit.NSImageScaleProportionallyDown)
+            if button.respondsToSelector_("setImageHugsTitle:"):
+                button.setImageHugsTitle_(True)
+            button.setToolTip_("Claude usage")
+            button.setAccessibilityLabel_("Claude usage")
+            _set_status_title(button, "")
             button.setTarget_(self)
             button.setAction_("togglePopover:")
             self.content = PopoverContentController.alloc().initWithHost_(self)
@@ -470,7 +510,7 @@ def _create_native_menubar(switcher: ClaudeAccountSwitcher):
 
         @objc.python_method
         def _render(self, model: MenuBarPopoverViewModel, title: str) -> None:
-            self.status_item.button().setTitle_(title)
+            _set_status_title(self.status_item.button(), title)
             timer = getattr(self, "refresh_timer", None)
             if timer is not None and int(round(timer.timeInterval())) != self.controller.settings.refresh_interval:
                 self._install_refresh_timer()
@@ -602,17 +642,6 @@ def _create_native_menubar(switcher: ClaudeAccountSwitcher):
             slot = str(sender.representedObject())
             if self._confirm("Remove account", f"Remove account {slot}? This cannot be undone.", "Remove"):
                 self.controller.remove_account(slot)
-
-        def toggleAccountName_(self, _sender) -> None:
-            self.controller.update_title_preferences(
-                show_account_name=not self.controller.settings.show_account_name
-            )
-
-        def toggleScoped_(self, _sender) -> None:
-            self.controller.update_title_preferences(title_scoped=not self.controller.settings.title_scoped)
-
-        def setTitlePercent_(self, sender) -> None:
-            self.controller.update_title_preferences(title_pct=str(sender.representedObject()))
 
         def setRefreshInterval_(self, sender) -> None:
             seconds = int(str(sender.representedObject()))

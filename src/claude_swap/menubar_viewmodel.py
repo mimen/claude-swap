@@ -28,10 +28,8 @@ from claude_swap.models import AccountsSnapshot
 from claude_swap.switcher import SENTINEL_NOTES
 from claude_swap.usage_store import SERVE_TTL_S, STALE_OK_S, UsageEntry
 
-ICON = "⇄"
 REFRESH_CHOICES: tuple[int, ...] = (30, 60, 300)
 AUTO_THRESHOLD_CHOICES: tuple[int, ...] = (80, 90, 95, 98)
-TITLE_PCT_CHOICES: tuple[str, ...] = ("off", "5h", "7d", "both")
 SWITCH_HISTORY_LIMIT = 10
 _WEEKLY_PERIOD_S = 7 * 86400
 
@@ -48,9 +46,6 @@ class MenuBarSettings:
     the menu bar share one policy source of truth.
     """
 
-    show_account_name: bool = True
-    title_pct: str = "both"
-    title_scoped: bool = False
     refresh_interval: int = 60
     auto_switch_enabled: bool = False
 
@@ -303,34 +298,40 @@ def format_title(
     now: float | None = None,
     alias: str | None = None,
 ) -> str:
-    """Build the menu-bar title from the active account and settings."""
+    """Build the percentage-only text displayed beside the Claude icon.
+
+    ``active_email``, ``alias``, and ``settings`` remain in the public signature
+    for existing callers, but the status item now shows the 5h, 7d, and first
+    scoped quota percentages without account identity or scope labels.
+    """
     if active_email is None:
-        return ICON
+        return ""
     if now is None:
         now = time.time()
     segments: list[str] = []
-    if settings.show_account_name:
-        segments.append(alias if alias else _local_part(active_email))
-    if settings.title_pct in ("5h", "both"):
-        pct = _window_pct(active_usage, "five_hour")
-        if pct is not None:
-            segments.append(f"{pct:.0f}%")
-    if settings.title_pct in ("7d", "both"):
-        seven_day = active_usage.get("seven_day") if isinstance(active_usage, dict) else None
-        seven_day = _rolled_weekly_window(seven_day, now)
-        pct = seven_day["pct"] if isinstance(seven_day, dict) and isinstance(seven_day.get("pct"), (int, float)) else None
-        if pct is not None:
-            segments.append(f"{pct:.0f}%")
-    if settings.title_scoped and isinstance(active_usage, dict):
+    pct = _window_pct(active_usage, "five_hour")
+    if pct is not None:
+        segments.append(f"{pct:.0f}%")
+    seven_day = active_usage.get("seven_day") if isinstance(active_usage, dict) else None
+    seven_day = _rolled_weekly_window(seven_day, now)
+    pct = (
+        seven_day["pct"]
+        if isinstance(seven_day, dict) and isinstance(seven_day.get("pct"), (int, float))
+        else None
+    )
+    if pct is not None:
+        segments.append(f"{pct:.0f}%")
+    if isinstance(active_usage, dict):
         scoped = active_usage.get("scoped")
         if isinstance(scoped, list):
             for raw_window in scoped:
-                window = _rolled_weekly_window(raw_window if isinstance(raw_window, dict) else None, now)
-                if isinstance(window, dict) and isinstance(window.get("pct"), (int, float)) and window.get("name"):
-                    segments.append(f"{window['name']} {window['pct']:.0f}%")
-    if not segments:
-        return ICON
-    return f"{ICON} " + " · ".join(segments)
+                window = _rolled_weekly_window(
+                    raw_window if isinstance(raw_window, dict) else None, now
+                )
+                if isinstance(window, dict) and isinstance(window.get("pct"), (int, float)):
+                    segments.append(f"{window['pct']:.0f}%")
+                    break
+    return " / ".join(segments)
 
 
 def format_usage_log(email: str, usage: dict | str | None) -> str | None:
@@ -606,13 +607,11 @@ __all__ = [
     "DisplayUsage",
     "EMPTY_SNAPSHOT",
     "FreshnessState",
-    "ICON",
     "MenuBarPopoverViewModel",
     "MenuBarSettings",
     "PopoverAccountViewModel",
     "REFRESH_CHOICES",
     "SWITCH_HISTORY_LIMIT",
-    "TITLE_PCT_CHOICES",
     "UsageRowViewModel",
     "UsageScope",
     "_account_display_usage",
