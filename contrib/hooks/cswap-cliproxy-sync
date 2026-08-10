@@ -1,0 +1,555 @@
+#!/usr/bin/env python3
+"""Synchronize a cswap post-switch event to CLIProxyAPI credential priority."""
+
+from __future__ import annotations
+
+import json
+import os
+import signal
+import stat
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from collections.abc import Callable
+from dataclasses import dataclass
+from pathlib import Path
+from typing import BinaryIO, NoReturn
+
+MAX_STDIN_BYTES = 64 * 1024
+MAX_KEY_BYTES = 8 * 1024
+MAX_RESPONSE_BYTES = 256 * 1024
+STREAM_CHUNK_BYTES = 8 * 1024
+STREAM_READ_INTERVAL_SECONDS = 0.1
+HTTP_TIMEOUT_SECONDS = 5.0
+TRANSACTION_TIMEOUT_SECONDS = 8.0
+MAX_NORMALIZATION_ATTEMPTS = 3
+MANAGEMENT_BASE_URL = "http://127.0.0.1:8317/v0/management"
+DEFAULT_KEY_FILE = Path.home() / ".cli-proxy-api-management-key"
+PRIORITY_MIN = -(2**31)
+PRIORITY_MAX = 2**31 - 1
+PROMOTION_HEADROOM = 100
+
+
+class AdapterError(Exception):
+    """A sanitized error safe to show on stderr."""
+
+
+@dataclass(frozen=True)
+class Credential:
+    name: str
+    email: str
+    disabled: bool
+    priority: int
+
+
+def fail(message: str) -> NoReturn:
+    """Print one bounded error line and terminate unsuccessfully."""
+    sanitized = " ".join(message.split())[:240]
+    print(f"cswap-cliproxy-sync: {sanitized}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def _valid_identity(value: object) -> bool:
+    if not isinstance(value, dict) or set(value) != {"number", "email"}:
+        return False
+    number = value.get("number")
+    email = value.get("email")
+    return type(number) is int and isinstance(email, str) and bool(email)
+
+
+def read_payload(stream: BinaryIO) -> str:
+    """Read the bounded, exact cswap event schema and return the target email."""
+    raw = stream.read(MAX_STDIN_BYTES + 1)
+    if len(raw) > MAX_STDIN_BYTES:
+        raise AdapterError("invalid payload")
+    try:
+        payload = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise AdapterError("invalid payload") from None
+    if not isinstance(payload, dict) or set(payload) != {
+        "schemaVersion",
+        "event",
+        "from",
+        "to",
+    }:
+        raise AdapterError("invalid payload")
+    source = payload["from"]
+    target = payload["to"]
+    if (
+        type(payload["schemaVersion"]) is not int
+        or payload["schemaVersion"] != 1
+        or payload["event"] != "postSwitch"
+        or (source is not None and not _valid_identity(source))
+        or not _valid_identity(target)
+    ):
+        raise AdapterError("invalid payload")
+    return target["email"]
+
+
+def _secure_key_stat(file_stat: os.stat_result, effective_uid: int) -> bool:
+    return (
+        stat.S_ISREG(file_stat.st_mode)
+        and file_stat.st_uid == effective_uid
+        and file_stat.st_mode & 0o077 == 0
+        and file_stat.st_mode & stat.S_IRUSR != 0
+        and 0 < file_stat.st_size <= MAX_KEY_BYTES
+    )
+
+
+def read_key(path: Path, *, effective_uid: int | None = None) -> str:
+    """Read a bounded owner-only regular key file without following symlinks."""
+    uid = os.geteuid() if effective_uid is None else effective_uid
+    descriptor = -1
+    try:
+        initial_stat = path.lstat()
+        if not _secure_key_stat(initial_stat, uid):
+            raise AdapterError("management key unavailable")
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        opened_stat = os.fstat(descriptor)
+        if (
+            not _secure_key_stat(opened_stat, uid)
+            or initial_stat.st_dev != opened_stat.st_dev
+            or initial_stat.st_ino != opened_stat.st_ino
+        ):
+            raise AdapterError("management key unavailable")
+        with os.fdopen(descriptor, "rb", closefd=True) as handle:
+            descriptor = -1
+            raw = handle.read(MAX_KEY_BYTES + 1)
+    except AdapterError:
+        raise
+    except OSError:
+        raise AdapterError("management key unavailable") from None
+    finally:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+    if not raw or len(raw) > MAX_KEY_BYTES:
+        raise AdapterError("management key unavailable")
+    try:
+        key = raw.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        raise AdapterError("management key unavailable") from None
+    if not key or "\r" in key or "\n" in key:
+        raise AdapterError("management key unavailable")
+    return key
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(
+        self,
+        request: urllib.request.Request,
+        file_pointer: object,
+        code: int,
+        message: str,
+        headers: object,
+        new_url: str,
+    ) -> None:
+        return None
+
+
+class ManagementClient:
+    """Minimal bounded CLIProxyAPI management client with one total deadline."""
+
+    def __init__(
+        self,
+        base_url: str,
+        key: str,
+        *,
+        deadline: float,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        parsed = urllib.parse.urlsplit(base_url)
+        if (
+            parsed.scheme != "http"
+            or parsed.hostname != "127.0.0.1"
+            or parsed.port is None
+            or parsed.path.rstrip("/") != "/v0/management"
+            or parsed.query
+            or parsed.fragment
+            or parsed.username is not None
+            or parsed.password is not None
+        ):
+            raise AdapterError("invalid management endpoint")
+        self._base_url = base_url.rstrip("/")
+        self._authorization = f"Bearer {key}"
+        self._deadline = deadline
+        self._clock = clock
+        self._opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}), _NoRedirectHandler()
+        )
+
+    def _remaining_deadline(self) -> float:
+        remaining = self._deadline - self._clock()
+        if remaining <= 0:
+            raise AdapterError("management transaction deadline exceeded")
+        return remaining
+
+    def _remaining_timeout(self) -> float:
+        return min(HTTP_TIMEOUT_SECONDS, self._remaining_deadline())
+
+    def has_time(self) -> bool:
+        """Return whether the shared transaction deadline still has time."""
+        return self._clock() < self._deadline
+
+    @staticmethod
+    def _set_stream_timeout(response: object, timeout: float) -> None:
+        file_pointer = getattr(response, "fp", None)
+        raw_stream = getattr(file_pointer, "raw", None)
+        sock = getattr(raw_stream, "_sock", None)
+        setter = getattr(sock, "settimeout", None)
+        if not callable(setter):
+            raise AdapterError("management API response invalid")
+        setter(timeout)
+
+    def _read_response(self, response: object) -> bytes:
+        chunks = bytearray()
+        reader = getattr(response, "read1", None)
+        closed = getattr(response, "isclosed", None)
+        if not callable(reader) or not callable(closed):
+            raise AdapterError("management API response invalid")
+        while True:
+            if closed():
+                return bytes(chunks)
+            remaining = self._remaining_timeout()
+            self._set_stream_timeout(
+                response, min(STREAM_READ_INTERVAL_SECONDS, remaining)
+            )
+            try:
+                chunk = reader(
+                    min(STREAM_CHUNK_BYTES, MAX_RESPONSE_BYTES + 1 - len(chunks))
+                )
+            except (TimeoutError, OSError):
+                if self._clock() >= self._deadline:
+                    raise AdapterError("management transaction deadline exceeded") from None
+                continue
+            if not chunk:
+                return bytes(chunks)
+            if not isinstance(chunk, bytes):
+                raise AdapterError("management API response invalid")
+            chunks.extend(chunk)
+            if len(chunks) > MAX_RESPONSE_BYTES:
+                raise AdapterError("management API response invalid")
+            if self._clock() >= self._deadline:
+                raise AdapterError("management transaction deadline exceeded")
+
+    @staticmethod
+    def _require_signal_guard() -> None:
+        required_functions = (
+            getattr(signal, "getitimer", None),
+            getattr(signal, "getsignal", None),
+            getattr(signal, "pthread_sigmask", None),
+            getattr(signal, "setitimer", None),
+            getattr(signal, "sigpending", None),
+            getattr(signal, "signal", None),
+            getattr(signal, "sigwait", None),
+        )
+        if (
+            threading.current_thread() is not threading.main_thread()
+            or not hasattr(signal, "ITIMER_REAL")
+            or not hasattr(signal, "SIGALRM")
+            or not hasattr(signal, "SIG_BLOCK")
+            or not hasattr(signal, "SIG_SETMASK")
+            or not all(callable(function) for function in required_functions)
+        ):
+            raise AdapterError("deadline guard unavailable")
+
+    def _perform_request(
+        self, request: urllib.request.Request, timeout: float
+    ) -> bytes:
+        try:
+            with self._opener.open(request, timeout=timeout) as response:
+                return self._read_response(response)
+        except urllib.error.HTTPError as error:
+            error.close()
+            if self._clock() >= self._deadline:
+                raise AdapterError("management transaction deadline exceeded") from None
+            raise AdapterError("management API request failed") from None
+        except (urllib.error.URLError, TimeoutError, OSError):
+            if self._clock() >= self._deadline:
+                raise AdapterError("management transaction deadline exceeded") from None
+            raise AdapterError("management API request failed") from None
+
+    def _request(self, method: str, path: str, body: dict[str, object] | None = None) -> bytes:
+        self._require_signal_guard()
+        encoded = None
+        headers = {
+            "Authorization": self._authorization,
+            "Accept": "application/json",
+        }
+        if body is not None:
+            encoded = json.dumps(body, separators=(",", ":")).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        request = urllib.request.Request(
+            f"{self._base_url}{path}", data=encoded, headers=headers, method=method
+        )
+        request_timeout = self._remaining_timeout()
+        alarm_set = {signal.SIGALRM}
+        guard_started = self._clock()
+        prior_mask: set[signal.Signals] | None = None
+        prior_handler: object | None = None
+        prior_timer = (0.0, 0.0)
+        preexisting_pending = False
+        handler_installed = False
+        timer_replaced = False
+        setup_complete = False
+
+        def deadline_handler(signum: int, frame: object) -> None:
+            raise AdapterError("management transaction deadline exceeded")
+
+        try:
+            try:
+                prior_mask = signal.pthread_sigmask(signal.SIG_BLOCK, alarm_set)
+            except Exception:
+                raise AdapterError("deadline guard unavailable") from None
+            preexisting_pending = signal.SIGALRM in signal.sigpending()
+            if signal.SIGALRM in prior_mask or preexisting_pending:
+                raise AdapterError("deadline guard unavailable")
+
+            prior_handler = signal.getsignal(signal.SIGALRM)
+            prior_timer = signal.getitimer(signal.ITIMER_REAL)
+            signal.signal(signal.SIGALRM, deadline_handler)
+            handler_installed = True
+            timer_replaced = True
+            signal.setitimer(signal.ITIMER_REAL, self._remaining_deadline())
+            signal.pthread_sigmask(signal.SIG_SETMASK, prior_mask)
+            setup_complete = True
+
+            result = self._perform_request(request, request_timeout)
+            if self._clock() >= self._deadline:
+                raise AdapterError("management transaction deadline exceeded")
+            return result
+        except AdapterError:
+            raise
+        except Exception:
+            if not setup_complete:
+                raise AdapterError("deadline guard unavailable") from None
+            raise
+        finally:
+            if prior_mask is not None:
+                cleanup_error: BaseException | None = None
+
+                def record_cleanup_error(error: BaseException) -> None:
+                    nonlocal cleanup_error
+                    if cleanup_error is None:
+                        cleanup_error = error
+
+                try:
+                    signal.pthread_sigmask(signal.SIG_BLOCK, alarm_set)
+                except BaseException as error:
+                    record_cleanup_error(error)
+                if timer_replaced:
+                    try:
+                        signal.setitimer(signal.ITIMER_REAL, 0)
+                    except BaseException as error:
+                        record_cleanup_error(error)
+                    try:
+                        pending = signal.sigpending()
+                        if signal.SIGALRM in pending and not preexisting_pending:
+                            signal.sigwait(alarm_set)
+                    except BaseException as error:
+                        record_cleanup_error(error)
+                if handler_installed and prior_handler is not None:
+                    try:
+                        signal.signal(signal.SIGALRM, prior_handler)
+                    except BaseException as error:
+                        record_cleanup_error(error)
+                if timer_replaced:
+                    elapsed = max(0.0, self._clock() - guard_started)
+                    prior_delay, prior_interval = prior_timer
+                    restored_delay = (
+                        max(0.000001, prior_delay - elapsed)
+                        if prior_delay > 0
+                        else 0.0
+                    )
+                    try:
+                        signal.setitimer(
+                            signal.ITIMER_REAL, restored_delay, prior_interval
+                        )
+                    except BaseException as error:
+                        record_cleanup_error(error)
+                try:
+                    signal.pthread_sigmask(signal.SIG_SETMASK, prior_mask)
+                except BaseException as error:
+                    record_cleanup_error(error)
+                if cleanup_error is not None:
+                    raise AdapterError("deadline guard unavailable") from None
+
+    @staticmethod
+    def _classification(row: dict[str, object]) -> bool:
+        present = [field for field in ("provider", "type") if field in row]
+        if not present:
+            raise AdapterError("malformed credential rows")
+        for field in present:
+            if not isinstance(row[field], str) or not row[field]:
+                raise AdapterError("malformed credential rows")
+        provider_is_claude = (
+            "provider" in row and str(row["provider"]).casefold() == "claude"
+        )
+        type_is_claude = "type" in row and str(row["type"]).casefold() == "claude"
+        if "provider" in row and "type" in row and provider_is_claude != type_is_claude:
+            raise AdapterError("contradictory credential rows")
+        return provider_is_claude or type_is_claude
+
+    def get_auth_files(self) -> list[Credential]:
+        """Fetch and validate all authoritative Claude credential rows."""
+        raw = self._request("GET", "/auth-files")
+        try:
+            response = json.loads(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise AdapterError("management API response invalid") from None
+        if not isinstance(response, dict) or set(response) != {"files"} or not isinstance(
+            response["files"], list
+        ):
+            raise AdapterError("management API response invalid")
+
+        credentials: list[Credential] = []
+        names: set[str] = set()
+        for row in response["files"]:
+            if not isinstance(row, dict):
+                raise AdapterError("malformed credential rows")
+            if not self._classification(row):
+                continue
+            name = row.get("name")
+            email = row.get("email")
+            disabled = row.get("disabled")
+            priority = row["priority"] if "priority" in row else 0
+            if (
+                not isinstance(name, str)
+                or not name
+                or not isinstance(email, str)
+                or not email
+                or not isinstance(disabled, bool)
+                or type(priority) is not int
+                or priority < PRIORITY_MIN
+                or priority > PRIORITY_MAX
+                or name in names
+            ):
+                raise AdapterError("malformed credential rows")
+            names.add(name)
+            credentials.append(Credential(name, email, disabled, priority))
+        return credentials
+
+    def set_priority(self, name: str, priority: int) -> None:
+        """Set one credential priority without changing any other field."""
+        self._request(
+            "PATCH", "/auth-files/fields", {"name": name, "priority": priority}
+        )
+
+
+def require_unique_target(credentials: list[Credential], email: str) -> Credential:
+    matches = [credential for credential in credentials if credential.email == email]
+    if len(matches) != 1:
+        raise AdapterError("target credential missing or duplicated")
+    target = matches[0]
+    if target.disabled:
+        raise AdapterError("target credential is disabled")
+    return target
+
+
+def _temporary_priority(credentials: list[Credential]) -> int:
+    if not credentials:
+        raise AdapterError("target credential missing or duplicated")
+    highest = max(max(credential.priority for credential in credentials), 100)
+    if highest > PRIORITY_MAX - PROMOTION_HEADROOM:
+        raise AdapterError("credential priority overflow")
+    return highest + PROMOTION_HEADROOM
+
+
+def _normalize_snapshot(
+    client: ManagementClient, credentials: list[Credential], target_email: str
+) -> None:
+    target = require_unique_target(credentials, target_email)
+    client.set_priority(target.name, _temporary_priority(credentials))
+    for credential in credentials:
+        if credential.name != target.name:
+            client.set_priority(credential.name, 0)
+    client.set_priority(target.name, 100)
+
+
+def _is_exact_state(credentials: list[Credential], target_email: str) -> bool:
+    matches = [credential for credential in credentials if credential.email == target_email]
+    if len(matches) != 1:
+        return False
+    target = matches[0]
+    return (
+        not target.disabled
+        and target.priority == 100
+        and all(
+            credential.name == target.name or credential.priority == 0
+            for credential in credentials
+        )
+    )
+
+
+def _best_effort_safe_promotion(
+    client: ManagementClient, credentials: list[Credential], target_email: str
+) -> None:
+    """Leave the intended target preferred after bounded convergence fails."""
+    try:
+        target = require_unique_target(credentials, target_email)
+        client.set_priority(target.name, _temporary_priority(credentials))
+    except AdapterError:
+        return
+
+
+def synchronize(client: ManagementClient, target_email: str) -> None:
+    """Converge bounded non-atomic updates, then verify exact priority state."""
+    snapshot = client.get_auth_files()
+    require_unique_target(snapshot, target_email)
+
+    for attempt in range(MAX_NORMALIZATION_ATTEMPTS):
+        if attempt > 0 and not client.has_time():
+            break
+        try:
+            _normalize_snapshot(client, snapshot, target_email)
+        except AdapterError:
+            if attempt == 0:
+                raise
+            break
+        observed = client.get_auth_files()
+        if _is_exact_state(observed, target_email):
+            return
+        snapshot = observed
+
+    # These PATCHes are not transactional. A writer racing after the final
+    # promotion cannot be prevented without server-side transaction support.
+    _best_effort_safe_promotion(client, snapshot, target_email)
+    raise AdapterError("priority verification failed")
+
+
+def run(
+    stream: BinaryIO,
+    *,
+    base_url: str = MANAGEMENT_BASE_URL,
+    key_path: Path = DEFAULT_KEY_FILE,
+) -> None:
+    """Run one event with explicit dependencies for local tests."""
+    target_email = read_payload(stream)
+    key = read_key(key_path)
+    deadline = time.monotonic() + TRANSACTION_TIMEOUT_SECONDS
+    synchronize(ManagementClient(base_url, key, deadline=deadline), target_email)
+
+
+def main() -> int:
+    """Run the installed adapter with fixed production dependencies."""
+    try:
+        run(
+            sys.stdin.buffer,
+            base_url="http://127.0.0.1:8317/v0/management",
+            key_path=Path.home() / ".cli-proxy-api-management-key",
+        )
+    except AdapterError as error:
+        fail(str(error))
+    except Exception:
+        fail("unexpected adapter failure")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
