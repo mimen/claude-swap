@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""Synchronize a cswap post-switch event to CLIProxyAPI credential priority."""
+"""Synchronize a cswap post-switch event to CLIProxyAPI credential selection.
+
+The target account's gateway credential is enabled and promoted; every other Claude
+credential is disabled and demoted. Priority alone is not enough: the gateway's failover is
+always on, so a dead target would silently serve requests from the other account. A disabled
+credential cannot be failed over to, so a dead target fails loudly instead. The gateway keeps
+refreshing disabled OAuth credentials on schedule (its scheduler never reads the disabled
+flag), so the parked account's grant stays alive until it is switched back to.
+"""
 
 from __future__ import annotations
 
@@ -435,10 +443,12 @@ class ManagementClient:
             credentials.append(Credential(name, email, disabled, priority))
         return credentials
 
-    def set_priority(self, name: str, priority: int) -> None:
-        """Set one credential priority without changing any other field."""
+    def set_fields(self, name: str, *, priority: int, disabled: bool) -> None:
+        """Set one credential's priority and enablement in a single PATCH."""
         self._request(
-            "PATCH", "/auth-files/fields", {"name": name, "priority": priority}
+            "PATCH",
+            "/auth-files/fields",
+            {"name": name, "priority": priority, "disabled": disabled},
         )
 
 
@@ -446,10 +456,8 @@ def require_unique_target(credentials: list[Credential], email: str) -> Credenti
     matches = [credential for credential in credentials if credential.email == email]
     if len(matches) != 1:
         raise AdapterError("target credential missing or duplicated")
-    target = matches[0]
-    if target.disabled:
-        raise AdapterError("target credential is disabled")
-    return target
+    # A disabled target is the normal pre-state: it was parked by the previous switch.
+    return matches[0]
 
 
 def _temporary_priority(credentials: list[Credential]) -> int:
@@ -465,11 +473,13 @@ def _normalize_snapshot(
     client: ManagementClient, credentials: list[Credential], target_email: str
 ) -> None:
     target = require_unique_target(credentials, target_email)
-    client.set_priority(target.name, _temporary_priority(credentials))
+    # Enable the target before disabling anything, so a failure part-way never leaves
+    # every Claude credential disabled.
+    client.set_fields(target.name, priority=_temporary_priority(credentials), disabled=False)
     for credential in credentials:
         if credential.name != target.name:
-            client.set_priority(credential.name, 0)
-    client.set_priority(target.name, 100)
+            client.set_fields(credential.name, priority=0, disabled=True)
+    client.set_fields(target.name, priority=100, disabled=False)
 
 
 def _is_exact_state(credentials: list[Credential], target_email: str) -> bool:
@@ -481,7 +491,8 @@ def _is_exact_state(credentials: list[Credential], target_email: str) -> bool:
         not target.disabled
         and target.priority == 100
         and all(
-            credential.name == target.name or credential.priority == 0
+            credential.name == target.name
+            or (credential.priority == 0 and credential.disabled)
             for credential in credentials
         )
     )
@@ -493,13 +504,13 @@ def _best_effort_safe_promotion(
     """Leave the intended target preferred after bounded convergence fails."""
     try:
         target = require_unique_target(credentials, target_email)
-        client.set_priority(target.name, _temporary_priority(credentials))
+        client.set_fields(target.name, priority=_temporary_priority(credentials), disabled=False)
     except AdapterError:
         return
 
 
 def synchronize(client: ManagementClient, target_email: str) -> None:
-    """Converge bounded non-atomic updates, then verify exact priority state."""
+    """Converge bounded non-atomic updates, then verify exact selection state."""
     snapshot = client.get_auth_files()
     require_unique_target(snapshot, target_email)
 
