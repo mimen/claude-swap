@@ -3578,6 +3578,7 @@ class ClaudeAccountSwitcher:
             if alias is not None:
                 seq["accounts"][account_num]["alias"] = alias
 
+            prior_ref = self._active_ref(seq)
             seq["activeAccountNumber"] = int(account_num)
             seq["lastUpdated"] = get_timestamp()
             self._write_json(self.sequence_file, seq)
@@ -3587,6 +3588,15 @@ class ClaudeAccountSwitcher:
             print(
                 f"{accent('Updated credentials')} for Account {account_num} "
                 f"({current_email} {muted(f'[{tag}]')})."
+            )
+            self._run_post_switch_hook(
+                {
+                    "from": prior_ref,
+                    "to": account_ref(int(account_num), current_email),
+                    "warnings": [],
+                },
+                emit_output=True,
+                reconcile=True,
             )
             return
 
@@ -3733,6 +3743,7 @@ class ClaudeAccountSwitcher:
         if int(account_num) not in data["sequence"]:
             data["sequence"].append(int(account_num))
             data["sequence"].sort()
+        prior_ref = self._active_ref(data)
         data["activeAccountNumber"] = int(account_num)
         data["lastUpdated"] = get_timestamp()
 
@@ -3742,6 +3753,15 @@ class ClaudeAccountSwitcher:
         if migrate_from:
             print(f"{dimmed(f'Moved from slot {migrate_from} → {slot}')}")
         print(f"{accent('Added')} Account {account_num}: {current_email} {muted(f'[{tag}]')}")
+        self._run_post_switch_hook(
+            {
+                "from": prior_ref,
+                "to": account_ref(int(account_num), current_email),
+                "warnings": [],
+            },
+            emit_output=True,
+            reconcile=True,
+        )
 
     def add_account_from_token(
         self,
@@ -5755,7 +5775,17 @@ class ClaudeAccountSwitcher:
 
         self.add_account()
 
-    def _run_post_switch_hook(self, op: dict, *, emit_output: bool) -> None:
+    def _active_ref(self, data: dict) -> dict | None:
+        """The account ``data`` records as active, shaped as a hook ``from``."""
+        number = data.get("activeAccountNumber")
+        if number is None:
+            return None
+        email = data.get("accounts", {}).get(str(number), {}).get("email", "")
+        return account_ref(int(number), email)
+
+    def _run_post_switch_hook(
+        self, op: dict, *, emit_output: bool, reconcile: bool = False
+    ) -> None:
         """Invoke the configured hook after a committed identity change.
 
         A dedicated cross-process lock orders hook side effects without holding
@@ -5763,8 +5793,18 @@ class ClaudeAccountSwitcher:
         hook lock is ours, re-check both the recorded slot and Claude's local
         live identity: a later switch or external /login may have superseded
         this result while we waited.
+
+        ``reconcile`` runs the hook even when the identity did not move. A hook
+        exists to make some external system follow the active account, and that
+        system drifts on its own when a gateway restarts, when a credential is
+        added outside cswap, or when an earlier hook run failed. Firing only on
+        a *change* left no way to repair that drift, because every command a
+        user reaches for once it has happened is one whose ``from`` equals its
+        ``to``.
         """
-        if op["from"] == op["to"] or os.environ.get(HOOK_ACTIVE_ENV) == "1":
+        if (
+            op["from"] == op["to"] and not reconcile
+        ) or os.environ.get(HOOK_ACTIVE_ENV) == "1":
             return
         executable = load_hooks_settings(self.backup_dir).post_switch
         if executable is None:
@@ -6380,7 +6420,12 @@ class ClaudeAccountSwitcher:
             provenance=provenance,
         )
         if not _defer_post_switch_hook:
-            self._run_post_switch_hook(op, emit_output=not json_output)
+            # --force re-establishes an identity on purpose, so it reconciles.
+            # It is the repair path when the live login and whatever the hook
+            # drives have drifted apart.
+            self._run_post_switch_hook(
+                op, emit_output=not json_output, reconcile=force
+            )
         result = self._switch_result_from_op(op, "direct") if json_output else None
         # A forced self-activation really rewrote the live credentials from the
         # stored backup — "already-active" would misdescribe that mutation.
