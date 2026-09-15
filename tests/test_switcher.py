@@ -7827,6 +7827,49 @@ class TestPostSwitchHook:
         assert result["reason"] == "already-active"
         assert not marker.exists()
 
+    def test_add_account_invokes_hook_when_it_changes_active_account(
+        self, temp_home, mock_claude_config, sample_sequence_data, tmp_path,
+        monkeypatch,
+    ):
+        """``cswap add`` moves activeAccountNumber, so the gateway must follow.
+
+        MEASURED IN THE FIELD (2026-09-10 to 09-15, this laptop): `add`
+        re-registered the live login into slot 1 and made it active, the hook
+        never ran, and a local CLIProxyAPI gateway kept serving the
+        previously-active slot for five days. `cswap status` reported the new
+        account the whole time, so the divergence was invisible: every request
+        billed the account the user thought he had left.
+        """
+        monkeypatch.setattr(
+            Platform, "detect", classmethod(lambda cls: Platform.LINUX)
+        )
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        sample_sequence_data["activeAccountNumber"] = 2
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+        switcher._write_credentials(json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-live-1", "refreshToken": "rt-live-1",
+        }}))
+        received = tmp_path / "hook-input.json"
+        hook = tmp_path / "post-switch-hook"
+        hook.write_text(
+            "#!/usr/bin/env python3\n"
+            "import pathlib, sys\n"
+            f"pathlib.Path({str(received)!r}).write_bytes(sys.stdin.buffer.read())\n"
+        )
+        hook.chmod(0o755)
+        set_setting(switcher.backup_dir, "hooks.postSwitch", str(hook))
+
+        with patch("claude_swap.oauth.fetch_oauth_profile", return_value=None):
+            switcher.add_account()
+
+        assert switcher._get_sequence_data()["activeAccountNumber"] == 1
+        assert received.exists(), "postSwitch hook never ran for `cswap add`"
+        assert json.loads(received.read_text())["to"] == {
+            "number": 1, "email": "test@example.com",
+        }
+
     def test_nonzero_hook_preserves_switch_and_adds_json_warning(
         self, temp_home, mock_claude_config, sample_sequence_data, tmp_path,
     ):
@@ -8087,9 +8130,19 @@ class TestPostSwitchHook:
             "to": {"number": 2, "email": "account2@example.com"},
         }
 
-    def test_forced_same_account_activation_does_not_run_hook(
+    def test_forced_same_account_activation_runs_hook(
         self, temp_home, mock_claude_config, sample_sequence_data, tmp_path,
     ):
+        """``--force`` re-establishes an identity, so the hook must run.
+
+        Deliberate reversal of the previous expectation. ``--force`` exists to
+        rewrite the live login from the stored backup, which is precisely the
+        repair a user reaches for when the gateway and claude-swap have
+        drifted. Suppressing the hook here left that user with no command that
+        could reconcile them: plain ``switch`` answers "Already on" and
+        returns, and ``--force`` mutated the live credential while leaving the
+        gateway on the old account.
+        """
         switcher, creds_store, configs_store = self._setup_two_accounts(
             temp_home, sample_sequence_data,
         )
@@ -8127,7 +8180,7 @@ class TestPostSwitchHook:
 
         assert result["reason"] == "activated"
         assert live_state["creds"] == stored
-        assert not marker.exists()
+        assert marker.exists()
 
 
 class TestSelfSwitchProvenance:
