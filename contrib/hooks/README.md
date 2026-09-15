@@ -25,7 +25,29 @@ talks to one account while anything routed through the gateway keeps using
 whichever credential the gateway happened to rank highest.
 
 The hook resolves the switch event's target email against the gateway's
-credential list and rewrites priorities so that account wins.
+credential list, then enables and promotes that credential while disabling and
+demoting every other Claude credential. Priority alone is not enough. The
+gateway's failover is always on, so a dead target would silently serve requests
+from the other account. A disabled credential cannot be failed over to, so a
+dead target fails loudly instead.
+
+### Repairing drift
+
+claude-swap runs this hook whenever the active account changes. That includes
+`cswap add` and the menu bar's "Add account" and "Refresh current credentials",
+which move the active account without going through a switch.
+
+When the two have drifted anyway, because the gateway restarted, a credential
+was added outside cswap, or an earlier hook run failed, reconcile them with:
+
+```
+cswap switch <num|email> --force
+```
+
+Plain `cswap switch <num>` answers "Already on" and returns without running the
+hook, which is useless precisely when a repair is needed. `--force`
+re-establishes the identity and runs the hook even when the account did not
+change.
 
 **Requirements**, all of which fail quietly if missed:
 
