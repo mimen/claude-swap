@@ -18,10 +18,10 @@ surface inside it.
 Two. One published Python package and one standalone hook that the package invokes. They
 share the repository and the switch-event contract, nothing else.
 
-| Component | Path | What it is |
-|---|---|---|
-| `claude-swap` | `src/claude_swap/` | The published wheel (hatchling, PyPI, `0.27.0b1`). One entry point `cli:main`, exposed as `claude-swap` and `cswap`. The CLI, the Textual TUI (`--tui`), and the macOS menu bar (`--menubar`) are surfaces of this one package, not separate builds. |
-| `post-switch hooks` | `contrib/hooks/` | Standalone executables `claude-swap` runs after a switch, wired through `hooks.postSwitch`. `cswap-cliproxy-sync` (555 lines) re-ranks a local CLIProxyAPI gateway's credentials. Not in the wheel, installed by hand. This is the fork's distinguishing content. |
+| Component | Path | What it is | Surfaces |
+|---|---|---|---|
+| `claude-swap` | `src/claude_swap/` | The published wheel (hatchling, PyPI, `0.27.0b1`). One entry point `cli:main`, exposed as `claude-swap` and `cswap`. The CLI, the Textual TUI (`--tui`), and the macOS menu bar (`--menubar`) are surfaces of this one package, not separate builds. | cli-tui, desktop |
+| `post-switch hooks` | `contrib/hooks/` | Standalone executables `claude-swap` runs after a switch, wired through `hooks.postSwitch`. `cswap-cliproxy-sync` (555 lines) re-ranks a local CLIProxyAPI gateway's credentials. Not in the wheel, installed by hand. This is the fork's distinguishing content. | cli-tui |
 
 The menu bar, TUI, and CLI are **surfaces of one package, not components**: one wheel, one
 entry point, reached by flags, sharing the switcher engine and the same state files. The
