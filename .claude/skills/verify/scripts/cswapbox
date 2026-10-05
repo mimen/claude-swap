@@ -1,0 +1,163 @@
+#!/bin/zsh
+# Runs this checkout's real cswap inside a disposable HOME under a macOS sandbox
+# that denies /usr/bin/security, the Security server, outbound network, and any
+# write outside the run's scratch directory.
+#   cswapbox new <proof-dir>                  create scratch, print its path
+#   cswapbox doctor <scratch>                 fail-closed readiness check
+#   cswapbox run <scratch> <proof-dir> ARGS   allowlisted cswap ARGS, transcript appended
+#   cswapbox tui <scratch> <proof-dir>        record a TUI session (ctrl+t, q)
+#   cswapbox shot <scratch> <proof-dir> NAME  TUI screenshot (svg + png)
+#   cswapbox cleanup <scratch>                remove scratch, keep evidence
+set -euo pipefail
+
+SELF=${0:A}
+SKILL_DIR=${SELF:h:h}
+REPO=${SKILL_DIR:h:h:h}
+CSWAP=$REPO/.venv/bin/cswap
+MARK=.cswap-verify-owner
+die() { print -u2 "cswapbox: $*"; exit 1; }
+
+# Only fixture operations reach cswap. Everything else, including service
+# install/uninstall, hooks, OAuth capture, auto, run, purge, upgrade, and any
+# unlisted flag (argparse accepts abbreviations), is refused before exec.
+allowed() {
+  local v=${1:-} x
+  [[ $v == menubar ]] && { [[ $# == 2 && $2 == --service-status ]] && return || refuse "menubar allows only --service-status"; }
+  for x in "${@:2}"; do
+    [[ $x == -* && $x != (--json|--email|--slot|--unset) ]] && refuse "flag $x"
+  done
+  case $v in
+    list|status|alias|swap|move|map|unmap|unclaimed|disable|enable|switch|tui) ;;
+    remove) (( $# == 2 )) || refuse "remove needs exactly one account" ;;
+    add-token)
+      [[ $# == 4 && $2 == sk-ant-api03-VERIFYFAKE* && $3 == --email && $4 == *@token.local ]] \
+        || refuse "add-token takes only: add-token sk-ant-api03-VERIFYFAKE… --email …@token.local" ;;
+    config)
+      case ${2:-list} in
+        list|get|path|--json) ;;
+        set|unset) [[ ${3:-} == (autoswitch.*|ui.theme) ]] || refuse "config $2 ${3:-} (only autoswitch.* and ui.theme)" ;;
+        *) refuse "config ${2:-}" ;;
+      esac ;;
+    *) refuse "command '${v}'" ;;
+  esac
+}
+refuse() { print -u2 "cswapbox: refused: $*"; exit 3; }
+
+proof_ok() {
+  local p=$1
+  [[ $p == /* && ${p:A} == $p && ! -L $p ]] || die "proof dir must be a canonical absolute non-symlink path: $p"
+  [[ $p != $REPO(|/*) && $p != /private/tmp/cswap-verify.* ]] || die "proof dir must be outside the checkout and scratch: $p"
+  [[ -d $p && -O $p ]] || die "proof dir must exist and be owned by $USER: $p"
+}
+
+doctored() {
+  [[ -f $1/doctor.ok && $(<$1/doctor.ok) == $(shasum -a 256 $SELF | cut -d' ' -f1) ]] \
+    || die "run 'cswapbox doctor $1' first (missing or stale for this helper)"
+  [[ ! -f $1/home/.claude-swap-backup/settings.json ]] || ! grep -q '"hooks"' $1/home/.claude-swap-backup/settings.json \
+    || die "scratch settings.json has a hooks section; refusing to drive"
+}
+
+owned() {
+  [[ $1 == /private/tmp/cswap-verify.* && -f $1/$MARK ]] || die "not a cswapbox scratch dir: $1"
+  [[ $(<$1/$MARK) == "cswap:verify@$REPO" ]] || die "scratch $1 belongs to another checkout"
+}
+
+boxed() {
+  local scratch=$1; shift
+  env -i PATH=/usr/bin:/bin HOME=$scratch/home USER=cswap-verify TMPDIR=$scratch/tmp \
+    TERM=${TERM:-xterm-256color} COLUMNS=120 LINES=36 PYTHONDONTWRITEBYTECODE=1 \
+    ${TEXTUAL_SCREENSHOT:+TEXTUAL_SCREENSHOT=$TEXTUAL_SCREENSHOT} \
+    ${TEXTUAL_SCREENSHOT_LOCATION:+TEXTUAL_SCREENSHOT_LOCATION=$TEXTUAL_SCREENSHOT_LOCATION} \
+    ${TEXTUAL_SCREENSHOT_FILENAME:+TEXTUAL_SCREENSHOT_FILENAME=$TEXTUAL_SCREENSHOT_FILENAME} \
+    /usr/bin/sandbox-exec -f $scratch/box.sb "$@"
+}
+
+cmd=${1:-}; shift || true
+case $cmd in
+new)
+  local proof=${1:?proof dir}; mkdir -p $proof; proof_ok $proof
+  local scratch=$(mktemp -d /private/tmp/cswap-verify.XXXXXX)
+  mkdir -p $scratch/home $scratch/tmp $scratch/work
+  print -r -- "cswap:verify@$REPO" > $scratch/$MARK
+  cat > $scratch/box.sb <<EOF
+(version 1)
+(allow default)
+(deny process-exec (literal "/usr/bin/security"))
+(deny mach-lookup (global-name "com.apple.SecurityServer") (global-name "com.apple.securityd"))
+(deny network-outbound (remote ip))
+(deny file-read* (subpath "$HOME/.claude-swap-backup") (subpath "$HOME/.claude") (literal "$HOME/.claude.json") (subpath "$HOME/Library/Keychains"))
+(deny file-write*)
+(allow file-write* (subpath "$scratch") (subpath "/dev"))
+EOF
+  {
+    print "source_sha $(git -C $REPO rev-parse HEAD)"
+    print "branch $(git -C $REPO branch --show-current)"
+    print "dirty_files"; git -C $REPO status --porcelain | sed 's/^/  /'
+    print "helper_sha256 $(shasum -a 256 $SELF | cut -d' ' -f1)"
+    print "tui_exp_sha256 $(shasum -a 256 $SKILL_DIR/scripts/tui.exp | cut -d' ' -f1)"
+    print "scratch $scratch"
+    print "created $(date -u +%FT%TZ)"
+  } > $proof/manifest.txt
+  print -r -- $scratch
+  ;;
+doctor)
+  local scratch=${1:?scratch}; owned $scratch
+  [[ -x $CSWAP ]] || die "missing $CSWAP; run 'uv sync --locked' in $REPO"
+  local mod=$(boxed $scratch $REPO/.venv/bin/python -c 'import claude_swap;print(claude_swap.__file__)')
+  [[ $mod == $REPO/src/claude_swap/__init__.py ]] || die "cswap imports $mod, not this checkout"
+  local root=$(boxed $scratch $CSWAP config path)
+  [[ $root == $scratch/home/* ]] || die "settings path $root escapes scratch HOME"
+  boxed $scratch /usr/bin/security list-keychains >/dev/null 2>&1 && die "sandbox allowed /usr/bin/security"
+  local probe=$(mktemp -d /private/tmp/cswap-verify-probe.XXXXXX)
+  print sentinel > $probe/sentinel; local before=$(shasum -a 256 $probe/sentinel)
+  boxed $scratch $REPO/.venv/bin/python -c "open('$probe/new','x')" 2>/dev/null || true
+  local leaked=$([[ -e $probe/new || $(shasum -a 256 $probe/sentinel) != $before ]] && print yes)
+  rm -rf -- $probe
+  [[ -z $leaked ]] || die "sandbox allowed a write outside scratch"
+  [[ -f $HOME/.claude-swap-backup/sequence.json ]] && boxed $scratch /bin/cat $HOME/.claude-swap-backup/sequence.json >/dev/null 2>&1 \
+    && die "sandbox allowed a read of the real account store"
+  [[ ! -f $scratch/home/.claude-swap-backup/settings.json ]] || ! grep -q '"hooks"' $scratch/home/.claude-swap-backup/settings.json \
+    || die "scratch settings.json has a hooks section"
+  boxed $scratch /usr/bin/curl -sS -m 3 -o /dev/null https://pypi.org 2>/dev/null && die "sandbox allowed network"
+  shasum -a 256 $SELF | cut -d' ' -f1 > $scratch/doctor.ok
+  print "ok source=$mod settings=$root keychain=denied network=denied outside_write=denied real_store_read=denied hooks=unset"
+  ;;
+run)
+  local scratch=${1:?scratch} proof=${2:?proof}; shift 2
+  allowed "$@"; proof_ok $proof; owned $scratch; doctored $scratch
+  local out rc=0
+  out=$(cd $scratch/work && boxed $scratch $CSWAP "$@" 2>&1) || rc=$?
+  { print -r -- "\$ cswap ${(j: :)${(q-)@}}"; print -r -- $out; print "[exit $rc]"; print } \
+    | sed -E 's/sk-ant-[A-Za-z0-9_-]+/<redacted>/g' | tee -a $proof/transcript.txt
+  return $rc
+  ;;
+tui)
+  local scratch=${1:?scratch} proof=${2:?proof}; proof_ok $proof; owned $scratch; doctored $scratch
+  cd $scratch/work
+  BOX=$SELF SCRATCH=$scratch REC=$proof/tui.typescript /usr/bin/expect $SKILL_DIR/scripts/tui.exp | tee $proof/tui-expect.log
+  print "replay: script -p $proof/tui.typescript"
+  ;;
+boxed-cswap)  # used by tui.exp under script(1)
+  local scratch=${1:?scratch}; shift
+  allowed "$@"; owned $scratch; doctored $scratch
+  boxed $scratch $CSWAP "$@"
+  ;;
+shot)
+  local scratch=${1:?scratch} proof=${2:?proof} name=${3:?name}; proof_ok $proof; owned $scratch; doctored $scratch
+  cd $scratch/work
+  TEXTUAL_SCREENSHOT=4 TEXTUAL_SCREENSHOT_LOCATION=$scratch/tmp TEXTUAL_SCREENSHOT_FILENAME=$name.svg \
+    /usr/bin/script -q /dev/null $SELF boxed-cswap $scratch tui >/dev/null </dev/null
+  cp $scratch/tmp/$name.svg $proof/
+  /usr/bin/qlmanage -t -s 1400 -o $scratch/tmp $proof/$name.svg >/dev/null 2>&1
+  mv $scratch/tmp/$name.svg.png $proof/$name.png
+  print $proof/$name.png
+  ;;
+cleanup)
+  local scratch=${1:?scratch}; owned $scratch
+  local live=$(/usr/sbin/lsof -t +D $scratch 2>/dev/null | sort -u | tr '\n' ' ' || true)
+  [[ -z ${live// } ]] || die "pids $live hold files in $scratch; left in place"
+  rm -rf -- $scratch
+  print "removed $scratch"
+  ;;
+*) sed -n '2,10p' $SELF; exit 2 ;;
+esac

@@ -1,0 +1,22 @@
+# Drives `cswap tui` under script(1) so the session is recorded with timing.
+# Env: BOX (cswapbox path), SCRATCH, REC (typescript output path).
+set timeout 20
+log_user 0
+spawn /usr/bin/script -r -q $env(REC) $env(BOX) boxed-cswap $env(SCRATCH) tui
+expect {
+  "Switch accounts" {}
+  timeout { puts "FAIL dashboard did not render"; exit 1 }
+}
+puts "OK dashboard rendered"
+sleep 1
+send "\x14"
+expect {
+  -re {Theme: (dark|light|auto)} { puts "OK toggled theme to $expect_out(1,string)" }
+  timeout { puts "FAIL no theme notification"; exit 1 }
+}
+sleep 1
+send "q"
+expect {
+  eof { puts "OK tui exited" }
+  timeout { puts "FAIL tui did not exit"; exit 1 }
+}
