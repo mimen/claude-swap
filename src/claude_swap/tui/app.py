@@ -286,8 +286,12 @@ class CswapApp(App):
                         timeout=8,
                     )
             else:
-                reason = str(payload.get("reason") or "no switch performed")
-                self.notify(reason, title="No switch", severity="warning")
+                message = str(
+                    payload.get("message")
+                    or payload.get("reason")
+                    or "no switch performed"
+                )
+                self.notify(message, title="No switch", severity="warning")
             return
         if show_output and result.output.strip():
             self.push_screen(OutputModal(label, result.output))

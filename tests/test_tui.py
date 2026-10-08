@@ -694,6 +694,30 @@ class TestRunAction:
             for call in notify.call_args_list
         )
 
+    def test_no_op_switch_shows_the_message_not_the_reason_slug(self, tmp_path):
+        fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
+        app = make_app(fake)
+        result = tui_data.ActionResult(
+            ok=True,
+            output="",
+            payload={
+                "switched": False,
+                "reason": "already-active",
+                "message": "Already on Account-1 (user1@example.com)",
+            },
+        )
+
+        with patch.object(app, "notify") as notify, patch.object(
+            app, "request_refresh"
+        ):
+            app._action_done("Switch to account 1", result, False)
+
+        notify.assert_called_once_with(
+            "Already on Account-1 (user1@example.com)",
+            title="No switch",
+            severity="warning",
+        )
+
     def test_captures_output_and_payload(self):
         def fn():
             print("hello")
