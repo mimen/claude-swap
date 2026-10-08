@@ -190,3 +190,26 @@ def test_payload_shape_constant_is_unchanged(tmp_path: Path):
         b'"from":{"number":1,"email":"a@example.com"},'
         b'"to":{"number":2,"email":"b@example.com"}}'
     )
+
+
+def test_unnumbered_from_ref_is_sent_as_null(tmp_path: Path):
+    """A live login that is not a managed slot is {number: null, email}.
+
+    The hook contract is null or a numbered identity. Sending the half-ref
+    makes a strict hook reject the event and leave the target unsynced.
+    """
+    if sys.platform == "win32":
+        pytest.skip("POSIX executable helper")
+    received = tmp_path / "payload"
+    hook = _executable(
+        tmp_path / "hook",
+        "import pathlib, sys\n"
+        f"pathlib.Path({str(received)!r}).write_bytes(sys.stdin.buffer.read())\n",
+    )
+
+    assert run_post_switch_hook(
+        str(hook), {"number": None, "email": "live@example.com"}, TO_REF
+    ) is None
+    body = json.loads(received.read_text())
+    assert body["from"] is None
+    assert body["to"] == TO_REF

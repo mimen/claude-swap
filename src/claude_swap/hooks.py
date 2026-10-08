@@ -141,6 +141,10 @@ def run_post_switch_hook(
     if path_warning is not None:
         return path_warning
 
+    # {number: null, email} is an unmanaged live login. Hooks accept null, not that half-ref.
+    if isinstance(from_ref, dict) and type(from_ref.get("number")) is not int:
+        from_ref = None
+
     payload = json.dumps(
         {
             "schemaVersion": 1,
