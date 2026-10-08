@@ -7706,7 +7706,7 @@ class TestPostSwitchHook:
         )
         hook = tmp_path / "post-switch-hook"
         hook.write_text(
-            "#!/usr/bin/env python3\n"
+            f"#!{sys.executable}\n"
             "import subprocess, sys\n"
             f"raise SystemExit(subprocess.run([sys.executable, '-c', {nested_code!r}]).returncode)\n"
         )
