@@ -213,6 +213,136 @@ class TestActiveReadStaysOnOneProfile:
         ]
 
 
+class TestActiveWritesStayOnOneProfile:
+    def test_switch_updates_custom_profile_without_changing_default(
+        self, temp_home, monkeypatch, block_real_keychain,
+    ):
+        from claude_swap.macos_keychain import keychain_account_name
+        from claude_swap.paths import get_global_config_path
+        from claude_swap.switcher import ClaudeAccountSwitcher
+
+        custom = temp_home / "custom-profile"
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(custom))
+        monkeypatch.delenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", raising=False)
+        monkeypatch.setattr(Platform, "detect", lambda: Platform.MACOS)
+        monkeypatch.setattr("claude_swap.migrations.run_migrations", lambda *a, **k: None)
+        account = keychain_account_name()
+        kc = block_real_keychain
+        kc.set_password(CLAUDE_CODE_KEYCHAIN_SERVICE, account, DEFAULT_PROFILE_CREDS)
+        kc.set_password(keychain_service_name(str(custom)), account, CUSTOM_PROFILE_CREDS)
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._init_sequence_file()
+        email = "target@example.com"
+        switcher._write_account_credentials("1", email, SECURE_PROFILE_CREDS)
+        switcher._write_account_config("1", email, json.dumps({
+            "oauthAccount": {
+                "emailAddress": email,
+                "accountUuid": "target-id",
+                "organizationUuid": "",
+            }
+        }))
+        switcher._write_json(switcher.sequence_file, {
+            "accounts": {"1": {"email": email, "uuid": "target-id", "organizationUuid": ""}},
+            "sequence": [1],
+            "activeAccountNumber": None,
+        })
+
+        result = switcher.switch_to("1", json_output=True, force=True)
+
+        assert result["switched"] is True
+        assert switcher._read_credentials() == SECURE_PROFILE_CREDS
+        assert json.loads(get_global_config_path().read_text())["oauthAccount"]["emailAddress"] == email
+        assert kc.get_password(CLAUDE_CODE_KEYCHAIN_SERVICE, account) == DEFAULT_PROFILE_CREDS
+
+    @pytest.mark.parametrize("secure_override", [None, "separate", ""])
+    @pytest.mark.parametrize("file_fallback", [False, True])
+    def test_oauth_write_matches_read_profile(
+        self, temp_home, monkeypatch, block_real_keychain,
+        secure_override, file_fallback,
+    ):
+        from claude_swap.macos_keychain import keychain_account_name
+
+        custom = temp_home / "custom-profile"
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(custom))
+        if secure_override is None:
+            monkeypatch.delenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", raising=False)
+            service = keychain_service_name(str(custom))
+        else:
+            secure = str(temp_home / "secure-profile") if secure_override else ""
+            monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", secure)
+            service = keychain_service_name(secure) if secure else CLAUDE_CODE_KEYCHAIN_SERVICE
+        account = keychain_account_name()
+        kc = block_real_keychain
+        kc.set_password(CLAUDE_CODE_KEYCHAIN_SERVICE, account, DEFAULT_PROFILE_CREDS)
+        kc.set_password(CLAUDE_CODE_MANAGED_KEYCHAIN_SERVICE, account, "sk-ant-api-default")
+        kc.set_password(service, account, CUSTOM_PROFILE_CREDS)
+        store = CredentialStore(_Host(temp_home / "backups"))
+        if file_fallback:
+            monkeypatch.setattr(store, "_use_keychain", lambda: False)
+
+        store._write_credentials(SECURE_PROFILE_CREDS)
+
+        assert store._read_active_credentials().value == SECURE_PROFILE_CREDS
+        assert kc.get_password(service, account) == (
+            None if file_fallback else SECURE_PROFILE_CREDS
+        )
+        if service != CLAUDE_CODE_KEYCHAIN_SERVICE:
+            assert kc.get_password(CLAUDE_CODE_KEYCHAIN_SERVICE, account) == DEFAULT_PROFILE_CREDS
+        assert kc.get_password(CLAUDE_CODE_MANAGED_KEYCHAIN_SERVICE, account) == "sk-ant-api-default"
+
+    def test_managed_write_preserves_default_profile(
+        self, temp_home, monkeypatch, block_real_keychain,
+    ):
+        from claude_swap.macos_keychain import keychain_account_name
+        from claude_swap.paths import get_global_config_path
+
+        custom = temp_home / "custom-profile"
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(custom))
+        monkeypatch.delenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", raising=False)
+        service = keychain_service_name(str(custom))
+        account = keychain_account_name()
+        kc = block_real_keychain
+        kc.set_password(CLAUDE_CODE_KEYCHAIN_SERVICE, account, DEFAULT_PROFILE_CREDS)
+        kc.set_password(CLAUDE_CODE_MANAGED_KEYCHAIN_SERVICE, account, "sk-ant-api-default")
+        kc.set_password(service, account, CUSTOM_PROFILE_CREDS)
+        store = CredentialStore(_Host(temp_home / "backups"))
+
+        store._write_credentials("sk-ant-api03-custom-profile")
+
+        active = store._read_active_credentials()
+        assert active.value == "sk-ant-api03-custom-profile"
+        assert active.degraded is False
+        assert json.loads(get_global_config_path().read_text())["primaryApiKey"] == "sk-ant-api03-custom-profile"
+        assert kc.get_password(service, account) is None
+        assert kc.get_password(CLAUDE_CODE_KEYCHAIN_SERVICE, account) == DEFAULT_PROFILE_CREDS
+        assert kc.get_password(CLAUDE_CODE_MANAGED_KEYCHAIN_SERVICE, account) == "sk-ant-api-default"
+
+        store._write_credentials(SECURE_PROFILE_CREDS)
+        assert kc.get_password(service, account) == SECURE_PROFILE_CREDS
+        assert not (custom / ".credentials.json").exists()
+
+    def test_explicit_default_profile_clears_both_oauth_items(
+        self, temp_home, monkeypatch, block_real_keychain,
+    ):
+        from claude_swap.macos_keychain import keychain_account_name
+
+        profile = temp_home / ".claude"
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(profile))
+        monkeypatch.delenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", raising=False)
+        account = keychain_account_name()
+        kc = block_real_keychain
+        kc.set_password(CLAUDE_CODE_KEYCHAIN_SERVICE, account, DEFAULT_PROFILE_CREDS)
+        kc.set_password(keychain_service_name(str(profile)), account, CUSTOM_PROFILE_CREDS)
+        store = CredentialStore(_Host(temp_home / "backups"))
+
+        store._write_credentials("sk-ant-api03-default-profile")
+
+        assert store._read_active_credentials().value == "sk-ant-api03-default-profile"
+        assert kc.get_password(CLAUDE_CODE_KEYCHAIN_SERVICE, account) is None
+        assert kc.get_password(keychain_service_name(str(profile)), account) is None
+
+
 class TestSecureStorageOverride:
     """``CLAUDE_SECURESTORAGE_CONFIG_DIR`` takes precedence when *defined*.
 

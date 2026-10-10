@@ -787,9 +787,10 @@ class CredentialStore:
         if self._host.platform != Platform.MACOS:
             return True
         try:
-            macos_keychain.delete_password(
-                CLAUDE_CODE_KEYCHAIN_SERVICE, macos_keychain.keychain_account_name()
-            )
+            for service in _active_oauth_keychain_services():
+                macos_keychain.delete_password(
+                    service, macos_keychain.keychain_account_name()
+                )
         except Exception:
             return False  # best-effort; a down Keychain can't be cleaned now
         return True
@@ -830,7 +831,7 @@ class CredentialStore:
             CredentialWriteError: If persisting the key fails.
         """
         wrote_to_keychain = False
-        if self._use_keychain():
+        if _active_profile_is_default() and self._use_keychain():
             try:
                 self._kc_call(
                     macos_keychain.set_password,
@@ -875,7 +876,11 @@ class CredentialStore:
 
         # Mutual exclusion: drop the OAuth credential so it can't shadow the key.
         self._clear_oauth_credential()
-        if self._host.platform == Platform.MACOS and not wrote_to_keychain:
+        if (
+            self._host.platform == Platform.MACOS
+            and _active_profile_is_default()
+            and not wrote_to_keychain
+        ):
             # Same stale-Keychain resurrection guard as the OAuth path: the key
             # fell back to plaintext ``primaryApiKey`` while a stale "Claude Code"
             # Keychain item may remain, and managed-key reads check the Keychain
@@ -911,7 +916,7 @@ class CredentialStore:
         per token while it lies, and a caller/log reader must be able to
         tell "nothing to clear" from "could not check".
         """
-        if self._host.platform == Platform.MACOS:
+        if self._host.platform == Platform.MACOS and _active_profile_is_default():
             try:
                 macos_keychain.delete_password(
                     CLAUDE_CODE_MANAGED_KEYCHAIN_SERVICE,
@@ -975,7 +980,7 @@ class CredentialStore:
             try:
                 self._kc_call(
                     macos_keychain.set_password,
-                    CLAUDE_CODE_KEYCHAIN_SERVICE,
+                    _active_oauth_keychain_services()[0],
                     macos_keychain.keychain_account_name(),
                     credentials,
                 )
