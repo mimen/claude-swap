@@ -3918,6 +3918,17 @@ class ClaudeAccountSwitcher:
         else:
             account_num = str(self._get_next_account_number())
 
+        # Carry the alias forward like ``add_account``: the record below is
+        # rebuilt from scratch, and the same account refreshed in place or
+        # moved to --slot keeps its name.
+        existing_alias = None
+        if slot is not None:
+            prior = data.get("accounts", {}).get(account_num) or {}
+            if displace_slot is None:
+                existing_alias = prior.get("alias")
+            if migrate_from:
+                existing_alias = data["accounts"][migrate_from].get("alias") or existing_alias
+
         if displace_slot:
             d_num, d_email, d_org = displace_slot
             self._delete_account_files(d_num, d_email)
@@ -3955,6 +3966,8 @@ class ClaudeAccountSwitcher:
         }
         if is_api_key:
             record["kind"] = "api_key"
+        if existing_alias:
+            record["alias"] = existing_alias
         data["accounts"][account_num] = record
         if int(account_num) not in data["sequence"]:
             data["sequence"].append(int(account_num))

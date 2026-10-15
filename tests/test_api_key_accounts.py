@@ -129,6 +129,18 @@ class TestAddTokenApiKey:
         assert len(data["accounts"]) == 1
         assert s._read_account_credentials("1", "me@example.com") == OTHER_KEY
 
+    @pytest.mark.parametrize("second_slot", [1, 2], ids=["same-slot", "move-slot"])
+    def test_explicit_slot_refresh_keeps_alias(self, temp_home: Path, second_slot):
+        # Same account re-added with --slot, in place or moving: add_account
+        # carries the alias across both, and the token path must too.
+        s = _linux_switcher()
+        s.add_account_from_token(API_KEY, email="me@example.com", slot=1)
+        s.set_alias("1", "work")
+        s.add_account_from_token(OTHER_KEY, email="me@example.com", slot=second_slot)
+        record = s._get_sequence_data()["accounts"][str(second_slot)]
+        assert record.get("alias") == "work"
+        assert s._resolve_account_identifier("work") == str(second_slot)
+
 
 class TestCrossKindCollision:
     def test_api_key_rejected_when_email_is_oauth(self, temp_home: Path):
