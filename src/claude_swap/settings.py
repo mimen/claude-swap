@@ -14,6 +14,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import math
 import os
 import sys
 import tempfile
@@ -186,7 +187,12 @@ def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
     """Clamp values into the SETTING_SPECS ranges; bad types → the default."""
 
     def num(value, default: float, lo: float, hi: float) -> float:
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
+        # NaN compares false in min/max; int(NaN) and int(inf) raise.
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+        ):
             return default
         return float(min(max(value, lo), hi))
 

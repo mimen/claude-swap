@@ -84,6 +84,19 @@ class TestLoadSettings:
         assert loaded.threshold == AutoSwitchSettings().threshold
         assert loaded.include_api_key_accounts is True
 
+    def test_nonfinite_numbers_fall_back_to_defaults(self, tmp_path: Path):
+        # json allows NaN/Infinity; int(NaN) raises and a NaN threshold
+        # never compares true, so auto-switch would silently stop.
+        settings_path(tmp_path).write_text(
+            '{"autoswitch": {"threshold": NaN, "intervalSeconds": Infinity, '
+            '"unhealthyTicks": NaN}}'
+        )
+        loaded = load_settings(tmp_path)
+        defaults = AutoSwitchSettings()
+        assert loaded.threshold == defaults.threshold
+        assert loaded.interval_seconds == defaults.interval_seconds
+        assert loaded.unhealthy_ticks == defaults.unhealthy_ticks
+
     def test_unsupported_strategy_falls_back_to_best(self, tmp_path: Path):
         settings_path(tmp_path).write_text(
             json.dumps({"autoswitch": {"strategy": "chaos"}})
@@ -302,6 +315,16 @@ class TestMergedWithCli:
     def test_cli_values_are_clamped(self):
         merged = merged_with_cli(AutoSwitchSettings(), _args(interval=1.0))
         assert merged.interval_seconds == 15.0
+
+    def test_nan_cli_overrides_fall_back_to_defaults(self):
+        merged = merged_with_cli(
+            AutoSwitchSettings(threshold=80.0),
+            _args(threshold=float("nan"), interval=float("nan"), cooldown=float("nan")),
+        )
+        defaults = AutoSwitchSettings()
+        assert merged.threshold == defaults.threshold
+        assert merged.interval_seconds == defaults.interval_seconds
+        assert merged.cooldown_seconds == defaults.cooldown_seconds
 
     def test_boolean_override(self):
         merged = merged_with_cli(
