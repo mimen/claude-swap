@@ -65,6 +65,41 @@ class TestSchema:
         store.path.write_text("{not json", encoding="utf-8")
         assert store.entries(IDENT)["1"] == UsageEntry()
 
+    def test_non_numeric_counters_do_not_drop_every_reader(self, store, clock):
+        store.path.parent.mkdir(parents=True)
+        store.path.write_text(
+            json.dumps(
+                {
+                    "schemaVersion": 2,
+                    "accounts": {
+                        "1": {
+                            "email": "a@x.com",
+                            "organizationUuid": "",
+                            "consecutiveFailures": "n/a",
+                            "authDeadStrikes": "n/a",
+                        },
+                        "2": {
+                            "email": "b@x.com",
+                            "organizationUuid": "org-2",
+                            "consecutiveFailures": 3,
+                            "fetchedAt": clock.now,
+                            "lastGood": USAGE,
+                        },
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        entries = store.entries(IDENT)
+        assert entries["1"].consecutive_failures == 0
+        assert entries["1"].auth_dead_strikes == 0
+        assert entries["2"].consecutive_failures == 3
+        assert entries["2"].last_good == USAGE
+        won = store.reserve(["1"], IDENT, respect_plans=False)
+        assert "1" in won
+        store.record({"1": FetchRecord(error="timeout")}, IDENT, claims=won)
+        assert store.entries(IDENT)["1"].consecutive_failures == 1
+
     def test_round_trip(self, store, clock):
         store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
         raw = json.loads(store.path.read_text(encoding="utf-8"))

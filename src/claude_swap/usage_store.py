@@ -898,7 +898,7 @@ class UsageStore:
                 fetched_at = None
             last_good = row.get("lastGood")
             age_s = (now - fetched_at) if fetched_at is not None else None
-            consecutive_failures = int(row.get("consecutiveFailures") or 0)
+            consecutive_failures = _int_counter(row.get("consecutiveFailures"))
             next_poll_at = _num_or_none(row.get("nextPollAt"))
             last_attempt_at = _num_or_none(row.get("lastAttemptAt"))
             claim_until = _num_or_none(row.get("claimUntil"))
@@ -943,7 +943,7 @@ class UsageStore:
                 next_poll_at=next_poll_at,
                 poll_interval_s=_num_or_none(row.get("pollIntervalS")),
                 last_429_at=_num_or_none(row.get("last429At")),
-                auth_dead_strikes=int(row.get("authDeadStrikes") or 0),
+                auth_dead_strikes=_int_counter(row.get("authDeadStrikes")),
                 struck_fingerprint=row.get("struckFingerprint"),
                 rejected_fingerprint=row.get("rejectedFingerprint"),
                 trust_extended=trust_extended,
@@ -1095,7 +1095,7 @@ class UsageStore:
                 row["rejectedFingerprint"] = None
                 row["authDeadStrikes"] = 0  # a success proves the token is alive
             else:
-                failures = int(row.get("consecutiveFailures") or 0) + 1
+                failures = _int_counter(row.get("consecutiveFailures")) + 1
                 row["consecutiveFailures"] = failures
                 row["lastError"] = rec.error
                 if rec.error == "http-429":
@@ -1111,7 +1111,7 @@ class UsageStore:
                 # transient error (429/timeout) leaves it as-is — it is no
                 # evidence either way and must not reset a real dead-token tally.
                 if rec.error in PERMANENT_AUTH_ERRORS:
-                    row["authDeadStrikes"] = int(row.get("authDeadStrikes") or 0) + 1
+                    row["authDeadStrikes"] = _int_counter(row.get("authDeadStrikes")) + 1
                     # Additive field (absent/None = legacy unconditional
                     # binding). Always overwrite: a legacy writer's strike
                     # must bind unconditionally, not inherit a stale
@@ -1195,12 +1195,22 @@ def _num_or_none(value: object) -> float | None:
     return float(value) if isinstance(value, (int, float)) else None
 
 
+def _int_counter(value: object) -> int:
+    """Stored counters are ints. A hand-edited non-number reads as zero."""
+    if isinstance(value, str) or isinstance(value, (int, float)):
+        try:
+            return int(value)
+        except (ValueError, OverflowError):
+            return 0
+    return 0
+
+
 def _row_eligible(
     row: dict, now: float, respect_plans: bool, repair_overslept: bool = False
 ) -> bool:
     """Fetch eligibility of a stored row, evaluated under the write lock
     (see :meth:`UsageStore.reserve` for the two caller modes)."""
-    if int(row.get("authDeadStrikes") or 0) >= AUTH_DEAD_STRIKES:
+    if _int_counter(row.get("authDeadStrikes")) >= AUTH_DEAD_STRIKES:
         return False
     backoff_until = _num_or_none(row.get("backoffUntil"))
     if backoff_until is not None and now < backoff_until:
