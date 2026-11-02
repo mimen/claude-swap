@@ -142,6 +142,27 @@ def test_load_corrupt_file_is_empty(tmp_path: Path):
     assert store.load() == {}
 
 
+def test_non_dict_entry_is_skipped(tmp_path: Path):
+    import json
+    backup = tmp_path / "backup"
+    backup.mkdir()
+    a = tmp_path / "a"
+    b = tmp_path / "b"
+    for d in (a, b):
+        d.mkdir()
+    (backup / "mappings.json").write_text(
+        json.dumps({"schemaVersion": 1, "mappings": {
+            normalize_path(a): "work@x.com",
+            normalize_path(b): {"email": "work@x.com", "organizationUuid": ""},
+        }}),
+        encoding="utf-8",
+    )
+    store = MappingStore(backup)
+    assert store.resolve(a / "sub") is None
+    assert store.prune_account("work@x.com", "") == 1
+    assert store.get(b) is None
+
+
 def test_normalize_path_expands_and_resolves(tmp_path: Path):
     repo = tmp_path / "repo"
     repo.mkdir()

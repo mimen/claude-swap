@@ -54,7 +54,9 @@ class MappingStore:
         if not isinstance(data, dict):
             return {}
         mappings = data.get("mappings", {})
-        return mappings if isinstance(mappings, dict) else {}
+        if not isinstance(mappings, dict):
+            return {}
+        return {k: v for k, v in mappings.items() if isinstance(v, dict)}
 
     def all(self) -> dict[str, dict]:
         """Public alias for the full mapping table."""
