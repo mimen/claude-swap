@@ -411,9 +411,7 @@ class ManagementClient:
             response = json.loads(raw)
         except (UnicodeDecodeError, json.JSONDecodeError):
             raise AdapterError("management API response invalid") from None
-        if not isinstance(response, dict) or set(response) != {"files"} or not isinstance(
-            response["files"], list
-        ):
+        if not isinstance(response, dict) or not isinstance(response.get("files"), list):
             raise AdapterError("management API response invalid")
 
         credentials: list[Credential] = []
