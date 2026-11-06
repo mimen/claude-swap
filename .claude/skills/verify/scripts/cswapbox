@@ -62,10 +62,15 @@ owned() {
   [[ $(<$1/$MARK) == "cswap:verify@$REPO" ]] || die "scratch $1 belongs to another checkout"
 }
 
+# A fixed size keeps transcripts and screenshots stable. boxed-cswap clears it
+# on a real terminal: Textual reads COLUMNS/LINES first and would lay out
+# 120x36 into a smaller window, scrolling the top rows away.
+BOX_COLUMNS=120 BOX_LINES=36
+
 boxed() {
   local scratch=$1; shift
   env -i PATH=/usr/bin:/bin HOME=$scratch/home USER=cswap-verify TMPDIR=$scratch/tmp \
-    TERM=${TERM:-xterm-256color} COLUMNS=120 LINES=36 PYTHONDONTWRITEBYTECODE=1 \
+    TERM=${TERM:-xterm-256color} ${BOX_COLUMNS:+COLUMNS=$BOX_COLUMNS} ${BOX_LINES:+LINES=$BOX_LINES} PYTHONDONTWRITEBYTECODE=1 \
     ${TEXTUAL_SCREENSHOT:+TEXTUAL_SCREENSHOT=$TEXTUAL_SCREENSHOT} \
     ${TEXTUAL_SCREENSHOT_LOCATION:+TEXTUAL_SCREENSHOT_LOCATION=$TEXTUAL_SCREENSHOT_LOCATION} \
     ${TEXTUAL_SCREENSHOT_FILENAME:+TEXTUAL_SCREENSHOT_FILENAME=$TEXTUAL_SCREENSHOT_FILENAME} \
@@ -140,6 +145,7 @@ tui)
 boxed-cswap)  # used by tui.exp under script(1)
   local scratch=${1:?scratch}; shift
   allowed "$@"; owned $scratch; doctored $scratch
+  [[ $(stty size 2>/dev/null) == <1->' '<1-> ]] && BOX_COLUMNS= BOX_LINES=
   boxed $scratch $CSWAP "$@"
   ;;
 shot)
