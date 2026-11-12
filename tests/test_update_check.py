@@ -55,6 +55,29 @@ class TestCheckForUpdate:
 
         assert result is None
 
+    @patch("claude_swap.update_check.urllib.request.urlopen")
+    def test_prerelease_current_still_notices_a_newer_release(self, mock_urlopen, tmp_path, monkeypatch):
+        # The installed package is 0.27.0b1. int("0b1") raised, and the
+        # outer except turned every notice into None.
+        monkeypatch.setattr("claude_swap.update_check.CACHE_PATH", tmp_path / "cache.json")
+        mock_urlopen.return_value = _make_pypi_response("0.28.0")
+
+        result = check_for_update("0.27.0b1")
+
+        assert result is not None
+        assert "0.28.0" in result
+
+    @patch("claude_swap.update_check.urllib.request.urlopen")
+    def test_final_is_newer_than_its_prerelease(self, mock_urlopen, tmp_path, monkeypatch):
+        monkeypatch.setattr("claude_swap.update_check.CACHE_PATH", tmp_path / "cache.json")
+        mock_urlopen.return_value = _make_pypi_response("0.27.0")
+
+        assert check_for_update("0.27.0b1") is not None
+
+        mock_urlopen.return_value = _make_pypi_response("0.27.0b1")
+        monkeypatch.setattr("claude_swap.update_check.CACHE_PATH", tmp_path / "other.json")
+        assert check_for_update("0.27.0") is None
+
     @patch("claude_swap.update_check.urllib.request.urlopen", side_effect=OSError("network error"))
     def test_network_error_returns_none_and_caches(self, mock_urlopen, tmp_path, monkeypatch):
         cache_path = tmp_path / "cache.json"

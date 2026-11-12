@@ -16,8 +16,32 @@ CACHE_TTL = 24 * 3600  # 24 hours
 PYPI_URL = "https://pypi.org/pypi/claude-swap/json"
 
 
-def _parse_version(v: str) -> tuple[int, ...]:
-    return tuple(int(x) for x in v.split("."))
+# ponytail: letter ranks only, no PEP 440 epoch/local. Add packaging if those show up.
+_PRE_RANK = {"a": 0, "alpha": 0, "b": 1, "beta": 1, "c": 2, "rc": 2}
+
+
+def _parse_version(v: str) -> tuple:
+    """Release numbers, then prerelease rank. ``0.27.0b1`` < ``0.27.0``."""
+    numbers: list[int] = []
+    pre: tuple = (1,)
+    for piece in v.split("."):
+        i = 0
+        while i < len(piece) and piece[i].isdigit():
+            i += 1
+        if i == 0:
+            raise ValueError(v)
+        numbers.append(int(piece[:i]))
+        rest = piece[i:]
+        if not rest:
+            continue
+        j = 0
+        while j < len(rest) and rest[j].isalpha():
+            j += 1
+        rank = _PRE_RANK.get(rest[:j].lower())
+        if rank is None or (rest[j:] and not rest[j:].isdigit()):
+            raise ValueError(v)
+        pre = (0, rank, int(rest[j:] or 0))
+    return (tuple(numbers), pre)
 
 
 def _detect_install_method() -> str | None:
