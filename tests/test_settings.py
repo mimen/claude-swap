@@ -84,6 +84,14 @@ class TestLoadSettings:
         assert loaded.threshold == AutoSwitchSettings().threshold
         assert loaded.include_api_key_accounts is True
 
+    def test_string_false_bool_stays_false(self, tmp_path: Path):
+        # bool("false") is True: a hand-edited "false" turned API-key
+        # rotation on.
+        settings_path(tmp_path).write_text(json.dumps({
+            "autoswitch": {"includeApiKeyAccounts": "false"}
+        }))
+        assert load_settings(tmp_path).include_api_key_accounts is False
+
     def test_nonfinite_numbers_fall_back_to_defaults(self, tmp_path: Path):
         # json allows NaN/Infinity; int(NaN) raises and a NaN threshold
         # never compares true, so auto-switch would silently stop.

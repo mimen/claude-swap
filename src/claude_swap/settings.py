@@ -205,6 +205,8 @@ def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
             clamped = num(value, spec.default, spec.lo, spec.hi)
             kwargs[spec.field] = int(clamped) if spec.kind == "int" else clamped
         elif spec.kind == "bool":
+            if isinstance(value, str):
+                value = _BOOL_WORDS.get(value.strip().lower(), spec.default)
             kwargs[spec.field] = bool(value)
         elif spec.kind == "string":
             # A non-empty string keeps as-is; anything else reverts to default
