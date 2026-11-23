@@ -376,6 +376,31 @@ class TestConflictPolicy:
         assert seq["accounts"]["1"]["email"] == "bob@example.com"
         assert seq["accounts"]["3"]["email"] == "alice@example.com"
 
+    @pytest.mark.parametrize("force,quarantine", [(True, False), (False, True)])
+    def test_overwrite_keeps_local_disabled_flag_and_alias(
+        self, temp_home: Path, force: bool, quarantine: bool
+    ):
+        """An import that rewrites an existing slot (--force, or the dead-token
+        auto-heal) refreshes its login; it must not put a `cswap disable`d
+        account back into rotation or drop its local alias."""
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 1, "alice@example.com")
+        out = temp_home / "alice.cswap"
+        export_accounts(s, str(out))  # exported before the alias existed
+
+        s.set_alias("1", "work")
+        s.set_account_disabled("1", True)
+        if quarantine:
+            s._usage_store.record(
+                {"1": FetchRecord(error="invalid_grant")},
+                {"1": ("alice@example.com", "")},
+            )
+
+        import_accounts(s, str(out), force=force)
+
+        assert s.is_account_disabled("1") is True
+        assert s._get_sequence_data()["accounts"]["1"]["alias"] == "work"
+
     def test_import_over_live_login_hints_force_activation(
         self, temp_home: Path, capsys
     ):

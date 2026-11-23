@@ -562,8 +562,15 @@ def import_accounts(
         }
         if entry["kind"] == "api_key":
             new_record["kind"] = "api_key"
-        if entry.get("alias"):
-            new_record["alias"] = entry["alias"]
+        # Rewriting an existing slot refreshes its login, not the user's
+        # local choices: a disabled account stays out of rotation, and an
+        # alias survives an export that carries none.
+        prior = data["accounts"].get(target_num, {}) if existing_slot else {}
+        if prior.get("disabled"):
+            new_record["disabled"] = True
+        alias = entry.get("alias") or prior.get("alias")
+        if alias:
+            new_record["alias"] = alias
         data["accounts"][target_num] = new_record
         if int(target_num) not in data["sequence"]:
             data["sequence"].append(int(target_num))
