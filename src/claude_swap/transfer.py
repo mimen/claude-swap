@@ -273,6 +273,8 @@ def export_accounts(
             entry["kind"] = "api_key"
         if record.get("alias"):
             entry["alias"] = record["alias"]
+        if record.get("disabled"):
+            entry["disabled"] = True
         accounts_payload.append(entry)
 
     if not accounts_payload:
@@ -431,6 +433,7 @@ def import_accounts(
                 "added": raw.get("added") or get_timestamp(),
                 "kind": "api_key" if is_api_key else "oauth",
                 "alias": alias,
+                "disabled": raw.get("disabled") is True,
                 "creds_text": creds_text,
                 "config_text": json.dumps(config_obj, indent=2),
             }
@@ -564,9 +567,10 @@ def import_accounts(
             new_record["kind"] = "api_key"
         # Rewriting an existing slot refreshes its login, not the user's
         # local choices: a disabled account stays out of rotation, and an
-        # alias survives an export that carries none.
+        # alias survives an export that carries none. A new slot takes the
+        # exported disabled flag.
         prior = data["accounts"].get(target_num, {}) if existing_slot else {}
-        if prior.get("disabled"):
+        if prior.get("disabled") or (not existing_slot and entry["disabled"]):
             new_record["disabled"] = True
         alias = entry.get("alias") or prior.get("alias")
         if alias:

@@ -189,6 +189,29 @@ class TestAliasTransfer:
                 assert seq["accounts"]["1"]["alias"] == "dev"
                 assert "alias" not in seq["accounts"]["2"]
 
+    def test_disabled_flag_round_trips(self, temp_home: Path):
+        """Restoring a backup into an empty store keeps a disabled account out
+        of rotation instead of silently re-enabling it."""
+        src = _linux_switcher(temp_home)
+        _seed_account(src, 1, "alice@example.com")
+        _seed_account(src, 2, "bob@example.com")
+        src.set_account_disabled("2", True)
+
+        out_file = temp_home / "backup.cswap"
+        export_accounts(src, str(out_file))
+        by_email = {a["email"]: a for a in json.loads(out_file.read_text())["accounts"]}
+        assert by_email["bob@example.com"]["disabled"] is True
+        assert "disabled" not in by_email["alice@example.com"]
+
+        dst_home = temp_home.parent / "dst"
+        dst_home.mkdir()
+        with patch("pathlib.Path.home", return_value=dst_home):
+            with patch.dict(os.environ, {"HOME": str(dst_home)}):
+                dst = _linux_switcher(dst_home)
+                import_accounts(dst, str(out_file))
+                assert dst.is_account_disabled("2") is True
+                assert dst.is_account_disabled("1") is False
+
     def test_import_alias_collision_with_local_drops_and_warns(self, temp_home: Path):
         dst_home = temp_home.parent / "dst"
         dst_home.mkdir()
