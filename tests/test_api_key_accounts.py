@@ -142,6 +142,14 @@ class TestAddTokenApiKey:
         assert s._resolve_account_identifier("work") == str(second_slot)
 
 
+    @pytest.mark.parametrize("second_slot", [1, 2], ids=["same-slot", "move-slot"])
+    def test_explicit_slot_refresh_keeps_disabled(self, temp_home: Path, second_slot):
+        s = _linux_switcher()
+        s.add_account_from_token(API_KEY, email="me@example.com", slot=1)
+        s.set_account_disabled("1", True)
+        s.add_account_from_token(OTHER_KEY, email="me@example.com", slot=second_slot)
+        assert s.is_account_disabled(str(second_slot))
+
 class TestCrossKindCollision:
     def test_api_key_rejected_when_email_is_oauth(self, temp_home: Path):
         s = _linux_switcher()

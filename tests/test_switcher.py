@@ -9493,6 +9493,21 @@ class TestAddAccountAlias:
         assert "1" not in data["accounts"]
         assert data["accounts"]["5"]["alias"] == "dev"
 
+    @pytest.mark.parametrize("second_slot", [1, 5], ids=["same-slot", "move-slot"])
+    def test_explicit_slot_readd_keeps_disabled(self, temp_home: Path, second_slot):
+        """`cswap add --slot` rebuilds the record; a `cswap disable`d account
+        must stay out of rotation, in place or moving slots."""
+        fake_creds = json.dumps({"claudeAiOauth": {"accessToken": "tok"}})
+        switcher = self._config_switcher(temp_home, "a@x.com")
+        with patch.object(switcher, "_read_active_credentials", return_value=ActiveCredentials(fake_creds, False)), \
+             patch.object(switcher, "_write_account_credentials"), \
+             patch.object(switcher, "_delete_account_credentials"):
+            switcher.add_account(slot=1)
+            switcher.set_account_disabled("1", True)
+            switcher.add_account(slot=second_slot)
+
+        assert switcher.is_account_disabled(str(second_slot))
+
     def test_add_account_duplicate_alias_raises(self, temp_home: Path):
         fake_creds = json.dumps({"claudeAiOauth": {"accessToken": "tok"}})
         switcher = self._config_switcher(temp_home, "a@x.com")
